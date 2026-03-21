@@ -199,7 +199,7 @@ with gr.Blocks(title="シンプル文字起こしツール") as demo:
 
 if __name__ == "__main__":
     print("==========================================================")
-    print("ブラウザで http://127.0.0.1:7860 を開いて操作してください。")
+    print("準備完了。自動的にブラウザが開きます。")
     print("==========================================================")
-    # localhostで起動。外部公開(share=False)
-    demo.launch(server_name="127.0.0.1", server_port=7860, share=False, inbrowser=True)
+    # localhostで起動。外部公開なし。ポートは空きポートを自動選択
+    demo.launch(server_name="127.0.0.1", share=False, inbrowser=True)
