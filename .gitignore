@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+transcription_result_*.txt
+transcription_result_*.srt
+output.log
+error.log
