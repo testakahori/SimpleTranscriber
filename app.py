@@ -24,48 +24,67 @@ def load_model():
             raise e
     return model
 
+def format_srt_time(seconds):
+    """秒数を SRT タイムコード形式 (HH:MM:SS,mmm) に変換する"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds - int(seconds)) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
 def transcribe(audio_path):
     if not audio_path:
-        return "エラー: 音声ファイルが提供されていません。", None
+        return "エラー: 音声ファイルが提供されていません。", None, None
 
     try:
         logging.info("文字起こしを開始します...")
         start_time = time.time()
-        
+
         m = load_model()
-        
+
         # vad_filter=Trueを入れることで無音部分のハルシネーション（幻覚）を防ぐ（長尺音声に非常に有効）
         segments, info = m.transcribe(audio_path, beam_size=5, vad_filter=True)
-        
+
         logging.info(f"検出言語: {info.language} (確率: {info.language_probability:.2f})")
-        
+
         full_text = ""
-        for segment in segments:
+        srt_lines = []
+        for i, segment in enumerate(segments, start=1):
             # ログには詳細なテキストは出さない（機密情報保護のため）
             logging.info(f"処理進捗: [{segment.start:.2f}s -> {segment.end:.2f}s]")
             full_text += segment.text + "\n"
-        
+            # SRT形式: 連番 / タイムコード / テキスト / 空行
+            srt_lines.append(str(i))
+            srt_lines.append(f"{format_srt_time(segment.start)} --> {format_srt_time(segment.end)}")
+            srt_lines.append(segment.text.strip())
+            srt_lines.append("")
+
         elapsed_time = time.time() - start_time
         logging.info(f"文字起こし完了。処理時間: {elapsed_time:.2f}秒")
-        
+
         if not full_text.strip():
-            return "音声からテキストが検出されませんでした。", None
-            
-        # txtファイルとして保存
-        output_file_name = f"transcription_result_{int(time.time())}.txt"
-        
-        # カレントディレクトリに保存
-        output_file_path = os.path.join(os.getcwd(), output_file_name)
-        with open(output_file_path, "w", encoding="utf-8") as f:
+            return "音声からテキストが検出されませんでした。", None, None
+
+        timestamp = int(time.time())
+        base_path = os.path.join(os.getcwd(), f"transcription_result_{timestamp}")
+
+        # TXTファイルとして保存
+        txt_path = base_path + ".txt"
+        with open(txt_path, "w", encoding="utf-8") as f:
             f.write(full_text.strip())
-            
-        return full_text.strip(), output_file_path
-        
+
+        # SRTファイルとして保存
+        srt_path = base_path + ".srt"
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(srt_lines))
+
+        return full_text.strip(), txt_path, srt_path
+
     except Exception as e:
         error_msg = f"エラーが発生しました: {str(e)}"
         # 機密情報のため、必要以上にスタックトレースは出力しない
         logging.error("エラーが発生しました。詳細は画面に出力されます。")
-        return error_msg, None
+        return error_msg, None, None
 
 # Gradio UIの構築
 with gr.Blocks(title="シンプル文字起こしツール") as demo:
@@ -80,12 +99,13 @@ with gr.Blocks(title="シンプル文字起こしツール") as demo:
             
         with gr.Column(scale=1):
             text_output = gr.Textbox(label="文字起こし結果", lines=15)
-            file_output = gr.File(label="結果ファイルのダウンロード (txt)")
-            
+            file_output_txt = gr.File(label="テキストダウンロード (txt)")
+            file_output_srt = gr.File(label="字幕ダウンロード (srt)")
+
     submit_btn.click(
         fn=transcribe,
         inputs=audio_input,
-        outputs=[text_output, file_output]
+        outputs=[text_output, file_output_txt, file_output_srt]
     )
 
 if __name__ == "__main__":
