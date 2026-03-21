@@ -168,7 +168,7 @@ with gr.Blocks(title="シンプル文字起こしツール") as demo:
 
     with gr.Row():
         with gr.Column(scale=1):
-            audio_input = gr.Audio(type="filepath", label="音声ファイル")
+            audio_input = gr.File(label="音声ファイル", file_types=[".mp3", ".wav", ".mp4", ".m4a", ".ogg", ".flac", ".aac", ".webm"])
             submit_btn = gr.Button("文字起こし開始", variant="primary")
             gr.Markdown("※長時間のファイル（数十分〜1時間）は、処理にPCのスペック依存でまとまった時間がかかります。\n画面を閉じずにそのままお待ちください。")
 
