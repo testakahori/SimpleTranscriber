@@ -1,35 +1,42 @@
 @echo off
 chcp 65001 > nul
-title シンプル文字起こしツール
+title Simple Transcriber
+cd /d "%~dp0"
+
 echo =========================================
-echo  シンプル文字起こしツール 起動準備中...
+echo  Simple Transcriber - Starting...
 echo =========================================
 
-REM 仮想環境の作成と有効化 (存在しない場合)
-if not exist "venv\Scripts\activate.bat" (
-    echo [情報] 初回セットアップ: 独自の処理環境を構築しています[venv]...
-    echo これは初回のみ数分かかります。
+set "PY=venv\Scripts\python.exe"
+
+if not exist "%PY%" (
+    echo [INFO] First run: creating virtual environment...
+    echo This may take a few minutes.
     python -m venv venv
+    if errorlevel 1 (
+        echo [ERROR] Failed to create virtual environment. Is Python installed?
+        pause
+        exit /b 1
+    )
 )
 
-echo [情報] 処理環境を読み込んでいます...
-call venv\Scripts\activate
-
-echo [情報] 必要な設定(ライブラリ)を確認しています...
-pip install -r requirements.txt --quiet
-if %errorlevel% neq 0 (
+echo [INFO] Checking dependencies...
+"%PY%" -m pip install -r requirements.txt --quiet
+if errorlevel 1 (
     echo.
-    echo [エラー] 設定の準備に失敗しました。
+    echo [ERROR] Failed to install dependencies.
     pause
-    exit /b %errorlevel%
+    exit /b 1
 )
+
+set KMP_DUPLICATE_LIB_OK=TRUE
 
 echo.
-echo [情報] 準備完了。文字起こしツールを起動します！
+echo [INFO] Ready. Launching transcription tool...
 echo =========================================
-echo ※ 自動的にブラウザが開きます。
-echo ※ 終了するときは、この黒い画面の右上の閉じるボタンで終了してください。
+echo  Browser will open automatically.
+echo  Close this window to stop the server.
 echo =========================================
-python app.py
+"%PY%" app.py
 
 pause

@@ -1,2 +1,18 @@
 faster-whisper
 gradio
+PyYAML
+httpx
+anthropic
+python-docx
+reportlab
+soundfile
+noisereduce
+truststore
+
+# --- Optional: speaker diarization / voiceprint (heavy, install manually) ---
+# torch
+# torchaudio
+# speechbrain
+
+# --- Optional: high-quality noise reduction ---
+# deepfilternet
