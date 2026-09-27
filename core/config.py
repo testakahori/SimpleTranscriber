@@ -31,6 +31,7 @@ DEFAULTS = {
     "whisper": {
         "model": "auto",  # auto | large-v3 | large-v3-turbo | kotoba-whisper-v2.0 | medium | small
         "language": "ja",  # ja | auto
+        "speed": "accurate",  # accurate | balanced | fast
     },
     "audio": {
         "noise_reduction": False,
