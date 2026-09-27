@@ -8,6 +8,13 @@ _models = {}  # (name, device) -> WhisperModel
 
 # 表示名 → faster-whisper に渡すモデルID
 MODEL_CHOICES = ["auto", "large-v3", "large-v3-turbo", "kotoba-whisper-v2.0", "medium", "small"]
+
+# 速度モード（実会議4分×2の実測。RTX 5060 Ti / large-v3）
+#   accurate: 1区間ずつ・ビーム幅5          … 基準（実時間の約2〜3倍速）
+#   balanced: 1区間ずつ・ビーム幅1          … 約2.4倍速・取りこぼし約5%増
+#   fast:     16区間まとめて処理(batched)   … 約8倍速・取りこぼし約15%増
+SPEED_CHOICES = [("精度優先（遅い）", "accurate"), ("バランス（約2.4倍速）", "balanced"),
+                 ("高速（約8倍速・取りこぼしと句読点が少し増減）", "fast")]
 MODEL_IDS = {
     "kotoba-whisper-v2.0": "kotoba-tech/kotoba-whisper-v2.0-faster",
 }
@@ -75,6 +82,15 @@ def unload() -> None:
     gc.collect()
 
 
+def _unstretch(w: dict) -> dict:
+    """文字数に比べて長すぎる単語（直前の無音を取り込んでいる）の開始時刻を後ろへ寄せる。
+    一括処理モードで起きやすく、放置すると「間」が消えて句読点・話者割り当てが狂う。"""
+    n = max(len(w["word"].strip()), 1)
+    if w["end"] - w["start"] > 0.3 * n + 0.8:
+        w["start"] = w["end"] - (0.18 * n + 0.3)
+    return w
+
+
 def _is_hallucination(seg) -> bool:
     text = seg.text.strip()
     if not text:
@@ -95,7 +111,7 @@ def _is_hallucination(seg) -> bool:
 
 def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
                initial_prompt: str = "", hotwords: str = "", duration: float = 0.0,
-               progress_cb=None) -> dict:
+               progress_cb=None, speed: str = "accurate") -> dict:
     """文字起こしを実行し、単語レベル確信度付きのセグメント一覧を返す。
 
     Returns:
@@ -125,13 +141,26 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
     )
     if language and language != "auto":
         kwargs["language"] = language
-    # 句読点付きのお手本を与えると、Whisperが「、」「。」を付けやすくなる
-    kwargs["initial_prompt"] = (PUNCT_PROMPT + (initial_prompt or ""))[:800]
-    if hotwords:
-        kwargs["hotwords"] = hotwords[:500]
+    engine = model
+    if speed == "fast":
+        # 16区間まとめてGPUに流す。文脈継続・お手本プロンプト・ホットワードは
+        # 一括処理だと逆に文字を大きく落とすため使わない（句読点は punctuate.py で補う）
+        from faster_whisper import BatchedInferencePipeline
+        engine = BatchedInferencePipeline(model=model)
+        for k in ("best_of", "condition_on_previous_text", "hallucination_silence_threshold",
+                  "vad_parameters"):
+            kwargs.pop(k, None)
+        kwargs.update(batch_size=16, chunk_length=15)
+    else:
+        if speed == "balanced":
+            kwargs.update(beam_size=1, best_of=1)
+        # 句読点付きのお手本を与えると、Whisperが「、」「。」を付けやすくなる
+        kwargs["initial_prompt"] = (PUNCT_PROMPT + (initial_prompt or ""))[:800]
+        if hotwords:
+            kwargs["hotwords"] = hotwords[:500]
 
     start_time = time.time()
-    segments_iter, info = model.transcribe(wav_path, **kwargs)
+    segments_iter, info = engine.transcribe(wav_path, **kwargs)
 
     total = duration or getattr(info, "duration", 0.0) or 0.0
     segments = []
@@ -148,10 +177,10 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
             continue
         words = []
         for w in (seg.words or []):
-            words.append({
+            words.append(_unstretch({
                 "start": float(w.start), "end": float(w.end),
                 "word": w.word, "prob": float(w.probability),
-            })
+            }))
         segments.append({
             "start": float(seg.start), "end": float(seg.end),
             "text": seg.text.strip(), "words": words,
@@ -165,6 +194,7 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
         "duration": total,
         "elapsed": elapsed,
         "model": name,
+        "speed": speed,
         "device": device,
         "dropped": dropped,
         "segments": segments,

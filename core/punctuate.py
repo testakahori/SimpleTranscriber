@@ -22,6 +22,10 @@ def _ends_with_punct(text: str) -> bool:
     return bool(text) and text.rstrip()[-1:] in PUNCT
 
 
+def _is_japanese(ch: str) -> bool:
+    return bool(ch) and ("぀" <= ch <= "ヿ" or "一" <= ch <= "鿿" or ch in "々〆ー")
+
+
 def _is_kanji(ch: str) -> bool:
     return bool(ch) and ("一" <= ch <= "鿿" or ch in "々〆")
 
@@ -52,9 +56,20 @@ def punctuate_segments(segments: list[dict]) -> int:
             gap = 10.0
         # 直前の数語をつなげて文末表現を判定（単語が細切れのため）
         tail = "".join(segments[a]["words"][b]["word"] for a, b in words[max(0, k - 3):k + 1]).strip()
+        # Whisperは日本語の文の切れ目を空白で表すことがある（特に一括処理モード）
+        space_break = False
+        if k + 1 < len(words):
+            nsi, nwi = words[k + 1]
+            nxt = segments[nsi]["words"][nwi]
+            if nxt["word"].startswith((" ", "　")) and _is_japanese(token.strip()[-1:]) \
+                    and _is_japanese(nxt["word"].strip()[:1]):
+                space_break = True
+                nxt["word"] = nxt["word"].lstrip(" 　")
         mark = ""
-        if QUESTION_RE.search(tail) and gap >= SOFT_PERIOD_GAP:
+        if QUESTION_RE.search(tail) and (gap >= SOFT_PERIOD_GAP or space_break):
             mark = "？"
+        elif space_break:
+            mark = "。" if (SENTENCE_END_RE.search(tail) or gap >= SOFT_PERIOD_GAP) else "、"
         elif gap >= PERIOD_GAP or (gap >= SOFT_PERIOD_GAP and SENTENCE_END_RE.search(tail)):
             mark = "。"
         elif gap >= COMMA_GAP and not _inside_word(token, words, k, segments):

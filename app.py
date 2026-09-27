@@ -178,7 +178,7 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
             wav, model_name=opts["model"], language=opts["language"],
             initial_prompt=glossary.build_initial_prompt(terms),
             hotwords=glossary.build_hotwords(terms),
-            duration=duration,
+            duration=duration, speed=opts.get("speed", "accurate"),
             progress_cb=lambda f: sub(0.05 + 0.75 * f, f"文字起こし中... {int(f * 100)}%"),
         )
         punctuate.punctuate_segments(result["segments"])  # 「、」「。」を推定して補う
@@ -202,7 +202,8 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
         u["marked"] = glossary.apply_corrections(people.apply_aliases(u["marked"], people_list))
         u["text"] = U.strip_marks(u["marked"])
 
-    meta_line = f"モデル: {result.get('model')}（{result.get('device')}）"
+    speed_label = dict((v, k) for k, v in transcriber.SPEED_CHOICES).get(result.get("speed"), "")
+    meta_line = f"モデル: {result.get('model')}（{result.get('device')}・{speed_label.split('（')[0]}）"
     job = {
         "job_dir": str(job_dir),
         "source": name,
@@ -278,7 +279,7 @@ def _write_meta(job: dict, opts: dict, settings: dict) -> None:
     })
 
 
-def run_batch(files, model_name, language, num_speakers, noise, diarize_on, do_proofread,
+def run_batch(files, model_name, speed, language, num_speakers, noise, diarize_on, do_proofread,
               do_minutes, do_insights, meeting_date, memo, progress=gr.Progress()):
     if not files:
         return ("⚠️ ファイルを選択してください。", gr.update()) + \
@@ -287,7 +288,7 @@ def run_batch(files, model_name, language, num_speakers, noise, diarize_on, do_p
     settings = config.load_settings()
     use_llm = (do_proofread or do_minutes or do_insights) and settings["llm"]["provider"] != "none"
     opts = {
-        "model": model_name, "language": language, "num_speakers": num_speakers,
+        "model": model_name, "speed": speed, "language": language, "num_speakers": num_speakers,
         "noise": noise, "diarize": diarize_on, "proofread": do_proofread,
         "minutes": do_minutes, "insights": do_insights, "use_llm": use_llm,
         "meeting_date": (meeting_date or "").strip(), "memo": (memo or "").strip(),
@@ -908,6 +909,10 @@ def build_ui():
                                 transcriber.MODEL_CHOICES, value=settings["whisper"]["model"],
                                 label="認識モデル", info="auto = GPUならlarge-v3（最高精度）",
                             )
+                        speed_radio = gr.Radio(
+                            transcriber.SPEED_CHOICES, value=settings["whisper"].get("speed", "accurate"),
+                            label="文字起こしの速さ",
+                            info="4時間の録音の目安: 精度優先 約1時間／バランス 約25分／高速 約8分")
                         meeting_date_box = gr.Textbox(
                             label="会議日時（任意）", placeholder="例: 2026年9月17日 10:00",
                             info="空欄ならファイル名から推定")
@@ -1166,7 +1171,7 @@ def build_ui():
 
         start_btn.click(
             fn=run_batch,
-            inputs=[files_input, model_dd, lang_dd, num_spk_dd, noise_cb, diarize_cb,
+            inputs=[files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, diarize_cb,
                     proofread_cb, minutes_cb, insights_cb, meeting_date_box, memo_box],
             outputs=[result_md, job_state] + view_outputs + [history_dd],
         ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)

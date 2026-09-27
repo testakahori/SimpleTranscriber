@@ -224,6 +224,102 @@ def speaker_color_map(utterances: list[dict]) -> dict:
 
 
 # =====================================================================
+# 1文ずつの行（表示・Markdown共通）
+# =====================================================================
+
+SENTENCE_SPLIT = "。？！?!"
+MAX_ROW_CHARS = 80  # 句点が無く長く続く発話は読点で区切る
+
+
+def _char_times(u: dict) -> list[tuple[float, float]]:
+    """発話テキスト1文字ごとの (開始, 終了) 時刻"""
+    text = u.get("text", "")
+    words = _aligned_words(u)
+    times = []
+    for w in words:
+        n = len(w["word"])
+        if n == 0:
+            continue
+        step = (w["end"] - w["start"]) / n
+        times += [(w["start"] + step * k, w["start"] + step * (k + 1)) for k in range(n)]
+    joined = "".join(w["word"] for w in words)
+    lead = len(joined) - len(joined.lstrip())
+    times = times[lead:lead + len(text)]
+    if len(times) != len(text):  # 念のため: 発話全体で均等割り
+        n = max(len(text), 1)
+        step = (u["end"] - u["start"]) / n
+        times = [(u["start"] + step * k, u["start"] + step * (k + 1)) for k in range(len(text))]
+    return times
+
+
+def _split_points(text: str) -> list[int]:
+    """文の区切り位置（区切り文字の直後のindex）"""
+    cuts, last = [], 0
+    for i, ch in enumerate(text):
+        if ch in SENTENCE_SPLIT:
+            cuts.append(i + 1)
+            last = i + 1
+        elif i - last >= MAX_ROW_CHARS and ch in "、，,":
+            cuts.append(i + 1)
+            last = i + 1
+    if not cuts or cuts[-1] != len(text):
+        cuts.append(len(text))
+    return cuts
+
+
+def _marked_slices(marked: str, plain_len: int):
+    """赤spanを含む文字列について、プレーン文字index → marked内の位置と「赤の中か」を返す"""
+    pos, in_red, i = [], [], 0
+    red = False
+    while i < len(marked):
+        if marked.startswith(RED_OPEN, i):
+            red = True
+            i += len(RED_OPEN)
+            continue
+        if marked.startswith(RED_CLOSE, i):
+            red = False
+            i += len(RED_CLOSE)
+            continue
+        pos.append(i)
+        in_red.append(red)
+        i += 1
+    return pos, in_red
+
+
+def sentence_rows(utterances: list[dict]) -> list[dict]:
+    """発話を1文ずつに区切った行 [{start, end, speaker, text, marked}]"""
+    rows = []
+    for u in utterances:
+        text = u.get("text", "")
+        if not text.strip():
+            continue
+        marked = u.get("marked") or text
+        times = _char_times(u)
+        pos, in_red = _marked_slices(marked, len(text))
+        use_marked = len(pos) == len(text)
+        start = 0
+        for cut in _split_points(text):
+            piece = text[start:cut]
+            if piece.strip():
+                lo = start + (len(piece) - len(piece.lstrip()))
+                hi = cut - (len(piece) - len(piece.rstrip()))
+                if use_marked and hi > lo:
+                    frag = marked[pos[lo]:pos[hi - 1] + 1]
+                    if in_red[lo] and not frag.startswith(RED_OPEN):
+                        frag = RED_OPEN + frag
+                    if frag.count(RED_OPEN) > frag.count(RED_CLOSE):
+                        frag += RED_CLOSE
+                else:
+                    frag = text[lo:hi]
+                rows.append({"start": times[lo][0] if times else u["start"],
+                             "end": times[hi - 1][1] if times else u["end"],
+                             "speaker": u.get("speaker", ""),
+                             "text": text[lo:hi], "marked": frag.replace(RED_OPEN + RED_CLOSE, "")})
+            start = cut
+    return rows
+
+
+# =====================================================================
 # Markdown
 # =====================================================================
 
@@ -261,12 +357,12 @@ def render_md(utterances: list[dict], source_name: str = "", duration: float = 0
                  "またはAIが文脈から推測した箇所です。")
     lines.append("")
 
-    for u in utterances:
-        ts = f"{format_hms(u['start'])} - {format_hms(u['end'])}"
-        speaker = u.get("speaker") or ""
-        head = f"**[{ts}] {speaker}**" if speaker else f"**[{ts}]**"
-        lines.append(head)
-        lines.append(u.get("marked") or u.get("text", ""))
+    # 1文ずつ「番号 / 時刻 / 話者: 本文」。Markdownで改行が消えないよう行末に2スペース
+    for i, r in enumerate(sentence_rows(utterances), 1):
+        lines.append(f"{i}  ")
+        lines.append(f"{format_srt_time(r['start'])} --> {format_srt_time(r['end'])}  ")
+        speaker = r.get("speaker") or ""
+        lines.append(f"**{speaker}:** {r['marked']}" if speaker else r["marked"])
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -293,17 +389,18 @@ VIEW_CSS = """
 .st-bar{height:6px;border-radius:3px;background:var(--border-color-primary,#e4e4e7);overflow:hidden;width:60px}
 .st-bar>i{display:block;height:100%}
 .st-list{max-height:640px;overflow-y:auto;padding-right:4px}
-.st-u{display:grid;grid-template-columns:92px 1fr;gap:10px;padding:10px 4px;
-  border-bottom:1px solid var(--border-color-primary,#eee)}
-.st-time{font-variant-numeric:tabular-nums;font-size:12px;color:var(--body-text-color-subdued,#71717a);
-  padding-top:3px;cursor:pointer;user-select:none}
+.st-u{padding:9px 6px;border-bottom:1px solid var(--border-color-primary,#eee)}
+.st-u.st-turn{border-top:2px solid var(--border-color-primary,#ddd)}
+.st-no{font-size:12px;color:var(--body-text-color-subdued,#71717a);font-variant-numeric:tabular-nums}
+.st-time{font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums;font-size:12px;
+  color:var(--body-text-color-subdued,#71717a);cursor:pointer;user-select:none;display:inline-block}
 .st-time:hover{text-decoration:underline}
-.st-sp{font-weight:700;font-size:13px;margin-bottom:2px}
+.st-sp{font-weight:700}
 .st-text{white-space:pre-wrap;word-break:break-word}
 .st-red{color:#dc2626;background:rgba(220,38,38,.08);border-radius:3px}
 .st-legend{font-size:12px;color:var(--body-text-color-subdued,#71717a);margin-bottom:8px}
 .st-player{width:100%;margin:0 0 10px}
-@media (max-width:640px){.st-u{grid-template-columns:1fr}.st-time{padding:0}}
+
 </style>
 """
 
@@ -339,18 +436,18 @@ def render_html(utterances: list[dict], audio_url: str = "") -> str:
     out.append('<div class="st-list">')
     seek_js = ("var a=document.getElementById('st-player');"
                "if(a){a.currentTime=%.2f;a.play();}")
-    for u in utterances:
-        sp = u.get("speaker") or ""
+    prev = None
+    for i, r in enumerate(sentence_rows(utterances), 1):
+        sp = r.get("speaker") or ""
         c = colors.get(sp, "#888")
-        onclick = f' onclick="{seek_js % u["start"]}"' if audio_url else ""
-        out.append('<div class="st-u">')
-        out.append(f'<div class="st-time" title="{format_hms(u["start"])} - {format_hms(u["end"])}"'
-                   f'{onclick}>{format_hms(u["start"])}</div>')
-        out.append("<div>")
-        if sp:
-            out.append(f'<div class="st-sp" style="color:{c}">{html.escape(sp)}</div>')
-        out.append(f'<div class="st-text">{_escape_keep_red(u.get("marked") or u.get("text", ""))}</div>')
-        out.append("</div></div>")
+        onclick = f' onclick="{seek_js % r["start"]}"' if audio_url else ""
+        turn = " st-turn" if prev is not None and sp != prev else ""
+        prev = sp
+        out.append(f'<div class="st-u{turn}"><div class="st-no">{i}</div>')
+        out.append(f'<div class="st-time"{onclick}>{format_srt_time(r["start"])} --&gt; '
+                   f'{format_srt_time(r["end"])}</div>')
+        label = f'<span class="st-sp" style="color:{c}">{html.escape(sp)}:</span> ' if sp else ""
+        out.append(f'<div class="st-text">{label}{_escape_keep_red(r["marked"])}</div></div>')
     out.append("</div></div>")
     return "".join(out)
 
