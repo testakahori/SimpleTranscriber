@@ -59,3 +59,26 @@ def list_md_files(job_name: str) -> list[str]:
 
 def job_path(job_name: str) -> Path:
     return OUTPUT_DIR / job_name
+
+
+def save_json(job_dir: Path, filename: str, data) -> Path:
+    path = Path(job_dir) / filename
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    return path
+
+
+def load_json(job_dir: Path, filename: str, default=None):
+    path = Path(job_dir) / filename
+    if not path.exists():
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def list_editable_jobs() -> list[str]:
+    """発言データ(utterances.json)を持つ＝アプリで開き直せるジョブ"""
+    return [j for j in list_jobs() if (OUTPUT_DIR / j / "utterances.json").exists()]

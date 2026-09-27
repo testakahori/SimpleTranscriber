@@ -103,3 +103,15 @@ def build_initial_prompt(people_terms: list[str]) -> str:
     if not uniq:
         return ""
     return "議事録。関連用語: " + "、".join(uniq)
+
+
+def build_hotwords(people_terms: list[str]) -> str:
+    """faster-whisper の hotwords（固有名詞を優先認識させるヒント）"""
+    terms = people_terms + load_glossary()
+    seen, uniq = set(), []
+    for t in terms:
+        t = str(t).strip()
+        if t and t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return " ".join(uniq)

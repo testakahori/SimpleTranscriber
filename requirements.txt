@@ -8,11 +8,11 @@ reportlab
 soundfile
 noisereduce
 truststore
+scikit-learn
 
-# --- Optional: speaker diarization / voiceprint (heavy, install manually) ---
-# torch
-# torchaudio
-# speechbrain
+# --- Speaker diarization / voiceprint ---
+# torch / torchaudio are installed by run.bat (CUDA build when an NVIDIA GPU is present)
+speechbrain
 
 # --- Optional: high-quality noise reduction ---
 # deepfilternet

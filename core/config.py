@@ -17,14 +17,19 @@ DEFAULTS = {
     "llm": {
         "provider": "ollama",  # ollama | anthropic | openai | none
         "ollama_url": "http://localhost:11434",
-        "ollama_model": "gemma4",
+        # gemma4 最上位（31B dense）の3bit量子化版。16GB VRAMに全部載るので4bit版の約10倍速い
+        "ollama_model": "hf.co/unsloth/gemma-4-31B-it-GGUF:UD-IQ3_XXS",
+        "ollama_num_gpu": 99,          # 全層をGPUへ（Ollamaの自動見積もりは控えめで一部CPUに逃がすため）
+        "ollama_think": False,         # 思考モード（議事録の質↑・時間↑）
+        "ollama_max_ctx": 16384,       # これを超える長い会議は区間ごとに要約してから議事録化
+        "ollama_fallback_model": "gemma4:12b-it-qat",  # メモリ不足で動かない時の代替
         "anthropic_model": "claude-opus-4-8",
         "anthropic_api_key": "",
         "openai_model": "gpt-4o",
         "openai_api_key": "",
     },
     "whisper": {
-        "model": "auto",  # auto | large-v3 | medium | small
+        "model": "auto",  # auto | large-v3 | large-v3-turbo | kotoba-whisper-v2.0 | medium | small
         "language": "ja",  # ja | auto
     },
     "audio": {
@@ -35,9 +40,19 @@ DEFAULTS = {
         "proofread": True,      # LLMによる校正・文脈補完
     },
     "diarization": {
-        "enabled": True,        # ライブラリ未導入なら自動でスキップ
-        "match_threshold": 0.75,
-        "cluster_threshold": 0.68,
+        "enabled": True,          # ライブラリ未導入なら自動でスキップ
+        "num_speakers": 0,        # 0=自動推定
+        "max_speakers": 12,       # 自動推定するときの上限人数
+        "match_similarity": 0.55,    # 声紋DBの人物と判定する類似度
+    },
+    "subtitle": {
+        "max_chars_line": 20,
+        "max_lines": 2,
+        "max_duration": 6.0,
+        "min_duration": 1.0,
+        "pause_split": 0.6,
+        "speaker_prefix": False,
+        "drop_period": True,
     },
 }
 

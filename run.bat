@@ -20,6 +20,19 @@ if not exist "%PY%" (
     )
 )
 
+rem --- PyTorch: use the CUDA build when an NVIDIA GPU is available ---
+where nvidia-smi > nul 2>&1
+if not errorlevel 1 (
+    "%PY%" -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" > nul 2>&1
+    if errorlevel 1 (
+        echo [INFO] Installing PyTorch with CUDA support. This is a large download, please wait...
+        "%PY%" -m pip install --upgrade torch torchaudio --index-url https://download.pytorch.org/whl/cu130
+        if errorlevel 1 (
+            echo [WARN] CUDA PyTorch install failed. Speaker identification will run on CPU.
+        )
+    )
+)
+
 echo [INFO] Checking dependencies...
 "%PY%" -m pip install -r requirements.txt --quiet
 if errorlevel 1 (
