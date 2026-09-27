@@ -38,9 +38,17 @@ def apply_aliases(text: str, people: list[dict] | None = None) -> str:
             if alias and alias != display:
                 pairs.append((alias, display))
     pairs.sort(key=lambda x: len(x[0]), reverse=True)
-    for alias, display in pairs:
-        text = text.replace(alias, display)
-    return text
+    if not pairs:
+        return text
+    # 既に正式表記になっている箇所・HTMLタグは置換しない（「坪内」→「坪内太郎」が
+    # 何度も適用されて「坪内太郎太郎」になるのを防ぐ）
+    import re
+    displays = sorted({d for _, d in pairs}, key=len, reverse=True)
+    alias_map = dict(pairs)
+    pattern = re.compile("|".join(
+        [r"<[^>]*>"] + [re.escape(d) for d in displays] + [re.escape(a) for a, _ in pairs]))
+    return pattern.sub(lambda m: alias_map.get(m.group(0), m.group(0))
+                       if m.group(0) not in displays else m.group(0), text)
 
 
 def initial_prompt_terms(people: list[dict] | None = None) -> list[str]:
