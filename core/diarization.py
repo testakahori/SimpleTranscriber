@@ -57,8 +57,9 @@ def _get_classifier():
 
 
 def unload() -> None:
-    global _classifier
+    global _classifier, _pya_pipeline
     _classifier = None
+    _pya_pipeline = None
     try:
         import gc
 
@@ -327,19 +328,72 @@ def _recheck_long_segments(data, segments, word_speakers, centroids, cluster_nam
     return changed
 
 
+def _name_clusters(centroids: dict, order: list, match_similarity: float):
+    """クラスタ → 表示名。声紋DBと照合（類似度の高い組から貪欲に確定し、同じ人物が
+    2クラスタに付かないようにする）。未知話者は登場順に 話者A, 話者B...
+    Returns: (cluster_names, matched)"""
+    known = load_voiceprints()
+    pairs = sorted(((float(cent @ vp), cid, name) for cid, cent in centroids.items()
+                    for name, vp in known.items()), reverse=True)
+    cluster_names, used, matched = {}, set(), {}
+    for sim, cid, name in pairs:
+        if sim < match_similarity:
+            break
+        if cid in cluster_names or name in used:
+            continue
+        cluster_names[cid] = name
+        used.add(name)
+        matched[name] = round(sim, 3)
+    letter = 0
+    for cid in order:
+        if cid not in cluster_names:
+            cluster_names[cid] = f"話者{chr(ord('A') + letter)}" if letter < 26 else f"話者{letter + 1}"
+            letter += 1
+    return cluster_names, matched
+
+
+def _assign_words(segments: list[dict], label_at) -> dict:
+    """各単語の中心時刻の話者を割り当てる → {seg_idx: [話者名 per word]}"""
+    word_speakers = {}
+    for si, seg in enumerate(segments):
+        words = seg.get("words") or []
+        if words:
+            word_speakers[si] = [label_at((w["start"] + w["end"]) / 2) for w in words]
+        else:
+            word_speakers[si] = [label_at((seg["start"] + seg["end"]) / 2)]
+    return word_speakers
+
+
 def diarize(wav_path: str, segments: list[dict], num_speakers: int = 0,
             max_speakers: int = 12, match_similarity: float = 0.55,
-            progress_cb=None):
+            hf_token: str = "", progress_cb=None):
     """話者分離＋声紋DB照合を実行する。
+
+    hf_token があり pyannote.audio が入っていれば pyannote（高精度）、
+    無ければ（または失敗したら）自前のスペクトルクラスタリングを使う。
 
     Returns:
         word_speakers: {seg_idx: [話者名 per word]}（単語が無いセグメントは長さ1のリスト）
-        cluster_embeddings: {話者名: 重心ベクトル} … UIでの割り当て→声紋保存用
+        cluster_embeddings: {話者名: 声紋ベクトル(ECAPA)} … UIでの割り当て→声紋保存用
         matched: {話者名: 類似度} … 声紋DBと照合できた人物
     失敗・ライブラリ未導入時は ({}, {}, {}) を返す。
     """
     if not available():
         return {}, {}, {}
+    if hf_token and pyannote_available():
+        try:
+            return _diarize_pyannote(wav_path, segments, num_speakers, max_speakers,
+                                     match_similarity, hf_token)
+        except Exception as e:
+            logging.exception(f"pyannoteでの話者分離に失敗したため自前方式に切り替えます: {e}")
+    return _diarize_spectral(wav_path, segments, num_speakers, max_speakers, match_similarity)
+
+
+def backend_label(hf_token: str) -> str:
+    return "pyannote" if hf_token and pyannote_available() else "声紋クラスタリング"
+
+
+def _diarize_spectral(wav_path, segments, num_speakers, max_speakers, match_similarity):
     import numpy as np
 
     try:
@@ -356,11 +410,7 @@ def diarize(wav_path: str, segments: list[dict], num_speakers: int = 0,
         chunks = [chunks[i] for i in keep]
         if not chunks:
             return {}, {}, {}
-        if progress_cb:
-            progress_cb(0.1)
         vecs = _embed_chunks(chunks)
-        if progress_cb:
-            progress_cb(0.7)
 
         cv, groups = _chunk_windows(vecs, windows)
         chunk_labels = _spectral_cluster(cv, num_speakers, max_speakers)
@@ -375,61 +425,128 @@ def diarize(wav_path: str, segments: list[dict], num_speakers: int = 0,
             m = vecs[labels == c].mean(axis=0)
             centroids[int(c)] = m / (np.linalg.norm(m) or 1.0)
 
-        # 声紋DB照合（類似度の高い組から貪欲に確定 → 同じ人物が2クラスタに付かない）
-        known = load_voiceprints()
-        pairs = []
-        for cid, cent in centroids.items():
-            for name, vp in known.items():
-                pairs.append((float(cent @ vp), cid, name))
-        pairs.sort(reverse=True)
-        cluster_names, used_names, matched = {}, set(), {}
-        for sim, cid, name in pairs:
-            if sim < match_similarity:
-                break
-            if cid in cluster_names or name in used_names:
-                continue
-            cluster_names[cid] = name
-            used_names.add(name)
-            matched[name] = round(sim, 3)
-
-        # 未知話者は登場順に 話者A, 話者B...
         first_seen = {}
         for i, c in enumerate(labels):
             first_seen.setdefault(int(c), i)
-        letter = 0
-        for cid in sorted(centroids, key=lambda c: first_seen.get(c, 1 << 30)):
-            if cid not in cluster_names:
-                cluster_names[cid] = (f"話者{chr(ord('A') + letter)}" if letter < 26
-                                      else f"話者{letter + 1}")
-                letter += 1
+        order = sorted(centroids, key=lambda c: first_seen.get(c, 1 << 30))
+        cluster_names, matched = _name_clusters(centroids, order, match_similarity)
 
-        # 単語 → 最も近い窓の話者
         centers = np.array([(s + e) / 2 for s, e in windows])
-        order = np.argsort(centers)
-        centers_sorted = centers[order]
+        idx_sorted = np.argsort(centers)
+        centers_sorted = centers[idx_sorted]
 
         def label_at(t: float) -> str:
             k = int(np.searchsorted(centers_sorted, t))
             cand = [x for x in (k - 1, k) if 0 <= x < len(centers_sorted)]
             best = min(cand, key=lambda x: abs(centers_sorted[x] - t))
-            return cluster_names[int(labels[order[best]])]
+            return cluster_names[int(labels[idx_sorted[best]])]
 
-        word_speakers = {}
-        for si, seg in enumerate(segments):
-            words = seg.get("words") or []
-            if words:
-                word_speakers[si] = [label_at((w["start"] + w["end"]) / 2) for w in words]
-            else:
-                word_speakers[si] = [label_at((seg["start"] + seg["end"]) / 2)]
-
+        word_speakers = _assign_words(segments, label_at)
         _recheck_long_segments(data, segments, word_speakers, centroids, cluster_names)
 
         cluster_embeddings = {cluster_names[cid]: centroids[cid] for cid in centroids}
-        logging.info(f"話者分離完了: {len(centroids)}名 / 窓{len(windows)}個 / 照合={matched}")
+        logging.info(f"話者分離完了(声紋クラスタリング): {len(centroids)}名 / 照合={matched}")
         return word_speakers, cluster_embeddings, matched
     except Exception as e:
         logging.exception(f"話者分離に失敗したためスキップします: {e}")
         return {}, {}, {}
+
+
+# ---------------------------------------------------------------------
+# pyannote.audio（WhisperX / kotoba-whisper-v2.2 と同じ話者分離エンジン）
+# ---------------------------------------------------------------------
+
+PYANNOTE_MODEL = "pyannote/speaker-diarization-community-1"
+_pya_pipeline = None
+
+
+def pyannote_available() -> bool:
+    return importlib.util.find_spec("pyannote.audio") is not None
+
+
+def _get_pyannote(hf_token: str):
+    global _pya_pipeline
+    if _pya_pipeline is None:
+        import torch
+        from pyannote.audio import Pipeline
+        logging.info(f"pyannote ({PYANNOTE_MODEL}) をロード中...")
+        _pya_pipeline = Pipeline.from_pretrained(PYANNOTE_MODEL, token=hf_token)
+        if torch.cuda.is_available():
+            _pya_pipeline.to(torch.device("cuda"))
+    return _pya_pipeline
+
+
+def _speaker_voiceprints(data, turns, max_sec: float = 90.0):
+    """pyannoteの各話者について、長めの発話から最大90秒分の声紋(ECAPA)を作る。
+    （声紋DB・声紋登録はECAPAで統一しているため、照合用にECAPAで計算し直す）"""
+    import numpy as np
+
+    by_spk = {}
+    for s, e, spk in turns:
+        by_spk.setdefault(spk, []).append((s, e))
+    centroids = {}
+    for spk, spans in by_spk.items():
+        spans = sorted(spans, key=lambda x: -(x[1] - x[0]))
+        chunks, total = [], 0.0
+        for s, e in spans:
+            if e - s < 1.0 or total >= max_sec:
+                continue
+            t = s
+            while t + 1.0 <= e and total < max_sec:  # 3秒ずつに区切る
+                seg_end = min(t + 3.0, e)
+                chunks.append(data[int(t * SAMPLE_RATE):int(seg_end * SAMPLE_RATE)])
+                total += seg_end - t
+                t = seg_end
+        if not chunks:  # 短い発話しか無い話者は全部使う
+            chunks = [data[int(s * SAMPLE_RATE):int(e * SAMPLE_RATE)] for s, e in spans
+                      if e - s >= 0.3][:30]
+        if not chunks:
+            continue
+        vecs = _embed_chunks(chunks, batch_size=32)
+        m = vecs.mean(axis=0)
+        centroids[spk] = m / (np.linalg.norm(m) or 1.0)
+    return centroids
+
+
+def _diarize_pyannote(wav_path, segments, num_speakers, max_speakers, match_similarity, hf_token):
+    import bisect
+
+    import torch
+
+    data = _load_wav(wav_path)
+    pipe = _get_pyannote(hf_token)
+    kwargs = {"num_speakers": int(num_speakers)} if num_speakers else {"max_speakers": int(max_speakers)}
+    out = pipe({"waveform": torch.from_numpy(data)[None, :], "sample_rate": SAMPLE_RATE}, **kwargs)
+    ann = getattr(out, "exclusive_speaker_diarization", None) or getattr(out, "speaker_diarization", out)
+    turns = sorted((seg.start, seg.end, spk) for seg, _, spk in ann.itertracks(yield_label=True))
+    if not turns:
+        return {}, {}, {}
+
+    centroids = _speaker_voiceprints(data, turns)
+    order = []
+    for _, _, spk in turns:
+        if spk not in order and spk in centroids:
+            order.append(spk)
+    cluster_names, matched = _name_clusters(centroids, order, match_similarity)
+    # 声紋が作れなかったごく短い話者は、時間的に近い話者として扱う
+    starts = [t[0] for t in turns]
+
+    def label_at(t: float) -> str:
+        k = bisect.bisect_right(starts, t) - 1
+        cand = [x for x in (k, k + 1) if 0 <= x < len(turns)]
+        def dist(x):
+            s, e, _ = turns[x]
+            return 0.0 if s <= t <= e else min(abs(t - s), abs(t - e))
+        for x in sorted(cand, key=dist):
+            spk = turns[x][2]
+            if spk in cluster_names:
+                return cluster_names[spk]
+        return next(iter(cluster_names.values()))
+
+    word_speakers = _assign_words(segments, label_at)
+    cluster_embeddings = {cluster_names[spk]: vec for spk, vec in centroids.items()}
+    logging.info(f"話者分離完了(pyannote): {len(centroids)}名 / 発話区間{len(turns)} / 照合={matched}")
+    return word_speakers, cluster_embeddings, matched
 
 
 # =====================================================================

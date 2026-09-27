@@ -190,7 +190,7 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
             word_speakers, cluster_embeddings, matched = diarization.diarize(
                 wav, result["segments"],
                 num_speakers=int(opts["num_speakers"] or 0),
-                max_speakers=int(dia.get("max_speakers", 12)),
+                max_speakers=int(dia.get("max_speakers", 12)), hf_token=dia.get("hf_token", ""),
                 match_similarity=float(dia.get("match_similarity", 0.55)),
             )
     finally:
@@ -388,7 +388,7 @@ def rediarize_job(state, num_speakers, progress=gr.Progress()):
         dia = settings.get("diarization", {})
         word_speakers, cluster_embeddings, matched = diarization.diarize(
             wav, segments, num_speakers=int(num_speakers or 0),
-            max_speakers=int(dia.get("max_speakers", 12)),
+            max_speakers=int(dia.get("max_speakers", 12)), hf_token=dia.get("hf_token", ""),
             match_similarity=float(dia.get("match_similarity", 0.55)),
         )
     finally:
@@ -833,7 +833,7 @@ def ollama_models(url: str) -> list[str]:
 
 def save_settings_ui(provider, ollama_url, ollama_model, ollama_think, anthropic_key,
                      anthropic_model, openai_key, openai_model, whisper_model, language,
-                     red_threshold, cluster_sim, match_sim):
+                     red_threshold, cluster_sim, match_sim, hf_token):
     settings = config.load_settings()
     settings["llm"].update({
         "provider": provider,
@@ -847,6 +847,7 @@ def save_settings_ui(provider, ollama_url, ollama_model, ollama_think, anthropic
     })
     settings["whisper"].update({"model": whisper_model, "language": language})
     settings["postprocess"]["red_threshold"] = float(red_threshold)
+    settings["diarization"]["hf_token"] = (hf_token or "").strip()
     settings["diarization"].update({"max_speakers": int(cluster_sim),
                                     "match_similarity": float(match_sim)})
     config.save_settings(settings)
@@ -883,7 +884,7 @@ def build_ui():
         gr.Markdown("# 🎙️ つよつよ文字起こし＆議事録ツール")
         gr.Markdown(
             f"文字起こし: {device_label} ／ 話者識別: "
-            f"{'✅ ' + dia_dev.upper() if dia_available else '➖ 未導入'} ／ "
+            f"{'✅ ' + diarization.backend_label(settings['diarization'].get('hf_token', '')) + '・' + dia_dev.upper() if dia_available else '➖ 未導入'} ／ "
             f"LLM: {llm.provider_label(settings)} ／ 登録声紋: {len(diarization.list_voiceprints())}名"
         )
 
@@ -1149,6 +1150,10 @@ def build_ui():
                 match_sim_slider = gr.Slider(
                     0.3, 0.9, value=settings["diarization"].get("match_similarity", 0.55),
                     step=0.01, label="声紋一致のしきい値（別人に名前が付くなら上げる／付かないなら下げる）")
+                hf_token_box = gr.Textbox(
+                    value=settings["diarization"].get("hf_token", ""), type="password",
+                    label="Hugging Face トークン（pyannote話者分離を使う）",
+                    info="pyannote/speaker-diarization-community-1 と pyannote/segmentation-3.0 の利用規約に同意したアカウントのトークン。空欄なら自前の声紋クラスタリング")
 
                 with gr.Row():
                     settings_save_btn = gr.Button("設定を保存", variant="primary")
@@ -1220,7 +1225,7 @@ def build_ui():
             inputs=[provider_radio, ollama_url_box, ollama_model_box, ollama_think_cb,
                     anthropic_key_box, anthropic_model_box, openai_key_box, openai_model_box,
                     whisper_model_dd, lang_default_dd, red_threshold_slider,
-                    cluster_sim_slider, match_sim_slider],
+                    cluster_sim_slider, match_sim_slider, hf_token_box],
             outputs=settings_status,
         )
         test_btn.click(fn=test_llm, outputs=settings_status)

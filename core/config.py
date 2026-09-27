@@ -43,6 +43,7 @@ DEFAULTS = {
         "enabled": True,          # ライブラリ未導入なら自動でスキップ
         "num_speakers": 0,        # 0=自動推定
         "max_speakers": 12,       # 自動推定するときの上限人数
+        "hf_token": "",           # 設定するとpyannote（高精度）で話者分離
         "match_similarity": 0.55,    # 声紋DBの人物と判定する類似度
     },
     "subtitle": {

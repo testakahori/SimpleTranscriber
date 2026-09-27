@@ -22,6 +22,20 @@ def _ends_with_punct(text: str) -> bool:
     return bool(text) and text.rstrip()[-1:] in PUNCT
 
 
+def _is_kanji(ch: str) -> bool:
+    return bool(ch) and ("一" <= ch <= "鿿" or ch in "々〆")
+
+
+def _inside_word(token: str, words, k: int, segments) -> bool:
+    """漢字1文字の直後が漢字で始まる場合は語の途中（「平、岡」のような分断を防ぐ）"""
+    t = token.strip()
+    if len(t) != 1 or not _is_kanji(t) or k + 1 >= len(words):
+        return False
+    nsi, nwi = words[k + 1]
+    nxt = segments[nsi]["words"][nwi]["word"].strip()
+    return _is_kanji(nxt[:1])
+
+
 def punctuate_segments(segments: list[dict]) -> int:
     """Whisperのセグメント列の単語に句読点を追記する（その場で変更）。追加した数を返す。"""
     words = [(si, wi) for si, seg in enumerate(segments) for wi, _ in enumerate(seg.get("words") or [])]
@@ -43,7 +57,7 @@ def punctuate_segments(segments: list[dict]) -> int:
             mark = "？"
         elif gap >= PERIOD_GAP or (gap >= SOFT_PERIOD_GAP and SENTENCE_END_RE.search(tail)):
             mark = "。"
-        elif gap >= COMMA_GAP:
+        elif gap >= COMMA_GAP and not _inside_word(token, words, k, segments):
             mark = "、"
         if mark:
             w["word"] = token.rstrip() + mark
