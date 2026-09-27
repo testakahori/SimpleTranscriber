@@ -13,6 +13,8 @@ scikit-learn
 # --- Speaker diarization / voiceprint ---
 # torch / torchaudio are installed by run.bat (CUDA build when an NVIDIA GPU is present)
 speechbrain
+# pyannote: high-accuracy diarization (used when a Hugging Face token is set in Settings)
+pyannote.audio>=4
 
 # --- Optional: high-quality noise reduction ---
 # deepfilternet
