@@ -9,6 +9,8 @@ soundfile
 noisereduce
 truststore
 scikit-learn
+# Japanese word boundaries (keeps punctuation / row breaks out of the middle of words)
+janome
 
 # --- Speaker diarization / voiceprint ---
 # torch / torchaudio are installed by run.bat (CUDA build when an NVIDIA GPU is present)

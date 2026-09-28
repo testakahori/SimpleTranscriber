@@ -9,6 +9,7 @@ from .utterances import RED_CLOSE, RED_OPEN, RED_RE, format_hms, strip_marks
 MINUTES_PROMPT = "議事録プロンプト_v3.md"
 PROOFREAD_PROMPT = "校正プロンプト_行単位.md"
 PROOFREAD_CHUNK_CHARS = 2500  # 1回のLLM呼び出しで校正する分量
+MINUTES_TEMPLATE = PROMPTS_DIR.parent / "議事録テンプレート.md"
 
 U_OPEN, U_CLOSE = "⟦", "⟧"
 
@@ -44,15 +45,20 @@ def _from_uncertain(text: str) -> str:
 _LINE_RE = re.compile(r"^\s*\[(\d+)\]\s*(.*)$")
 
 
-def proofread_utterances(settings: dict, utterances: list[dict], progress_cb=None) -> tuple[int, int]:
+def proofread_utterances(settings: dict, utterances: list[dict], progress_cb=None,
+                         skip=None, on_chunk=None) -> tuple[int, int]:
     """発言リストをその場で校正する。(校正できた発言数, 変更された発言数) を返す。
 
     LLMの出力で番号が欠けた行は元のまま残す（壊さないことを優先）。
+    skip: True を返した発言は校正しない（校正済み・手修正済み → 途中から再開できる）
+    on_chunk: 1回分（約2500字）終わるごとに呼ぶ（途中保存用）
     """
     system = _load_prompt(PROOFREAD_PROMPT) + _context_block()
 
     chunks, cur, size = [], [], 0
     for i, u in enumerate(utterances):
+        if skip and skip(u):
+            continue
         cur.append(i)
         size += len(u.get("text", ""))
         if size >= PROOFREAD_CHUNK_CHARS:
@@ -108,6 +114,10 @@ def proofread_utterances(settings: dict, utterances: list[dict], progress_cb=Non
             u["marked"], u["text"] = new_marked, new_text
             u["proofread"] = True
             done += 1
+        for i in idxs:  # AIが返さなかった行も「見た」印を付け、再開時に繰り返さない
+            utterances[i]["proofread"] = True
+        if on_chunk:
+            on_chunk()
         if progress_cb:
             progress_cb((ci + 1) / len(chunks))
     return done, changed
@@ -194,9 +204,20 @@ def _shrink_transcript(settings: dict, system: str, transcript: str) -> str:
     return shrunk
 
 
+def _template_block() -> str:
+    """ルートの 議事録テンプレート.md があれば、その形に合わせるよう指示する（書き換えれば形を変えられる）"""
+    if not MINUTES_TEMPLATE.exists():
+        return ""
+    tpl = MINUTES_TEMPLATE.read_text(encoding="utf-8").strip()
+    if not tpl:
+        return ""
+    return ("\n\n# 議事録テンプレート（見出しの名前・順番・構成はこのテンプレートを最優先で守ること。"
+            "議題の数や箇条書きの数は会議の内容に合わせて増減してよい）\n" + tpl)
+
+
 def generate_minutes(settings: dict, transcript: str, source_name: str = "",
                      meeting_date: str = "") -> str:
-    system = _load_prompt(MINUTES_PROMPT) + _context_block()
+    system = _load_prompt(MINUTES_PROMPT) + _template_block() + _context_block()
     transcript = _shrink_transcript(settings, system, transcript)
     user = (f"{_header(source_name, meeting_date)}\n"
             f"次の文字起こしから議事録を作成してください。\n\n{transcript}")
