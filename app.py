@@ -166,16 +166,20 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
     job_dir = output.create_job_dir(name)
 
     sub(0.01, "音声を変換中...")
-    wav = audio.prepare_audio(path, noise_reduction=opts["noise"])
-    duration = audio.get_duration(wav)
-    preview = audio.make_preview_audio(path, str(job_dir / "audio.m4a"))
-
-    people_list = people.load_people()
-    terms = people.initial_prompt_terms(people_list)
+    wav = audio.prepare_audio(path)
+    asr_wav = wav
     try:
+        duration = audio.get_duration(wav)
+        preview = audio.make_preview_audio(path, str(job_dir / "audio.m4a"))
+        if opts["noise"]:
+            sub(0.03, "文字起こし用に音声を補正中（ノイズ除去）...")
+        asr_wav = audio.enhance_for_asr(wav, eq=opts.get("eq", True), noise_reduction=opts["noise"])
+
+        people_list = people.load_people()
+        terms = people.initial_prompt_terms(people_list)
         sub(0.05, "文字起こし中...")
         result = transcriber.transcribe(
-            wav, model_name=opts["model"], language=opts["language"],
+            asr_wav, model_name=opts["model"], language=opts["language"],
             initial_prompt=glossary.build_initial_prompt(terms),
             hotwords=glossary.build_hotwords(terms),
             duration=duration, speed=opts.get("speed", "accurate"),
@@ -195,9 +199,14 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
             )
     finally:
         Path(wav).unlink(missing_ok=True)
+        if asr_wav != wav:
+            Path(asr_wav).unlink(missing_ok=True)
 
     threshold = settings.get("postprocess", {}).get("red_threshold", 0.5)
     utts = U.build_utterances(result["segments"], word_speakers, threshold)
+    fillers = 0
+    if opts.get("fillers", True):
+        utts, fillers = U.remove_fillers(utts, threshold)
     for u in utts:
         u["marked"] = glossary.apply_corrections(people.apply_aliases(u["marked"], people_list))
         u["text"] = U.strip_marks(u["marked"])
@@ -220,6 +229,7 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
             "whisper_model": result.get("model"),
             "device": result.get("device"),
             "hallucinations_dropped": result.get("dropped", 0),
+            "fillers_removed": fillers,
             "elapsed_sec": round(result.get("elapsed", 0), 1),
         },
     }
@@ -271,6 +281,8 @@ def _write_meta(job: dict, opts: dict, settings: dict) -> None:
         "duration_sec": round(job.get("duration", 0.0), 1),
         **job.get("stats", {}),
         "noise_reduction": opts["noise"],
+        "asr_eq": opts.get("eq", True),
+        "remove_fillers": opts.get("fillers", True),
         "llm_provider": llm.provider_label(settings) if opts["use_llm"] else "なし",
         "speakers": [s[0] for s in U.speaker_stats(job["utterances"])],
         "voiceprint_matched": job.get("matched", {}),
@@ -279,7 +291,7 @@ def _write_meta(job: dict, opts: dict, settings: dict) -> None:
     })
 
 
-def run_batch(files, model_name, speed, language, num_speakers, noise, diarize_on, do_proofread,
+def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on, do_proofread,
               do_minutes, do_insights, meeting_date, memo, progress=gr.Progress()):
     if not files:
         return ("⚠️ ファイルを選択してください。", gr.update()) + \
@@ -289,7 +301,7 @@ def run_batch(files, model_name, speed, language, num_speakers, noise, diarize_o
     use_llm = (do_proofread or do_minutes or do_insights) and settings["llm"]["provider"] != "none"
     opts = {
         "model": model_name, "speed": speed, "language": language, "num_speakers": num_speakers,
-        "noise": noise, "diarize": diarize_on, "proofread": do_proofread,
+        "noise": noise, "eq": eq_on, "fillers": fillers_on, "diarize": diarize_on, "proofread": do_proofread,
         "minutes": do_minutes, "insights": do_insights, "use_llm": use_llm,
         "meeting_date": (meeting_date or "").strip(), "memo": (memo or "").strip(),
     }
@@ -923,9 +935,15 @@ def build_ui():
                             lang_dd = gr.Dropdown(
                                 ["ja", "auto"], value=settings["whisper"]["language"],
                                 label="言語", info="ja=日本語固定（推奨）")
+                            eq_cb = gr.Checkbox(
+                                value=settings["audio"]["asr_eq"],
+                                label="音質補正（低音のうなり・高域ノイズをカット／推奨）")
                             noise_cb = gr.Checkbox(
                                 value=settings["audio"]["noise_reduction"],
-                                label="ノイズ除去（雑音の多い録音向け・時間増）")
+                                label="背景ノイズ除去（空調・雑音を弱めに除去／推奨）")
+                            fillers_cb = gr.Checkbox(
+                                value=settings["postprocess"]["remove_fillers"],
+                                label="フィラー除去（「えー」「えーっと」「うーん」などを消す）")
                             diarize_cb = gr.Checkbox(
                                 value=dia_available, interactive=dia_available,
                                 label="話者識別・声紋照合" + ("" if dia_available else "（未導入）"))
@@ -1171,7 +1189,7 @@ def build_ui():
 
         start_btn.click(
             fn=run_batch,
-            inputs=[files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, diarize_cb,
+            inputs=[files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, eq_cb, fillers_cb, diarize_cb,
                     proofread_cb, minutes_cb, insights_cb, meeting_date_box, memo_box],
             outputs=[result_md, job_state] + view_outputs + [history_dd],
         ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)

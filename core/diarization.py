@@ -464,10 +464,35 @@ def pyannote_available() -> bool:
     return importlib.util.find_spec("pyannote.audio") is not None
 
 
+def _patch_speechbrain_lazy_modules() -> None:
+    """speechbrainの遅延モジュールは inspect から触られた時だけ無視する作りだが、
+    判定が "/inspect.py" 固定のため Windows（パスが \\ 区切り）では効かない。
+    その結果、pyannote読み込み中の inspect.stack() が未導入の k2 を読みに行って失敗し、
+    自前方式へ落ちていた。読み込めない遅延モジュールは「属性なし」として扱わせる。"""
+    try:
+        from speechbrain.utils import importutils
+    except ImportError:
+        return
+    lazy = getattr(importutils, "LazyModule", None)
+    if lazy is None or getattr(lazy, "_st_patched", False):
+        return
+    original = lazy.__getattr__
+
+    def __getattr__(self, attr):
+        try:
+            return original(self, attr)
+        except ImportError as e:
+            raise AttributeError(attr) from e
+
+    lazy.__getattr__ = __getattr__
+    lazy._st_patched = True
+
+
 def _get_pyannote(hf_token: str):
     global _pya_pipeline
     if _pya_pipeline is None:
         import torch
+        _patch_speechbrain_lazy_modules()
         from pyannote.audio import Pipeline
         logging.info(f"pyannote ({PYANNOTE_MODEL}) をロード中...")
         _pya_pipeline = Pipeline.from_pretrained(PYANNOTE_MODEL, token=hf_token)
