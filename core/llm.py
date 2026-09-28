@@ -55,7 +55,8 @@ def _is_resource_error(resp) -> bool:
     text = resp.text
     return resp.status_code == 500 and (
         "out of memory" in text or "unexpectedly stopped" in text
-        or "failed to allocate" in text or "resource limitations" in text)
+        or "failed to allocate" in text or "resource limitations" in text
+        or "bad_alloc" in text)  # llama-server がRAM不足で落ちた時の表記
 
 
 def _retry_on_resource_error(url: str, payload: dict, resp, llm_settings: dict):
