@@ -11,6 +11,7 @@ except Exception:
 import datetime
 import logging
 import re
+import time
 import traceback
 from pathlib import Path
 
@@ -75,6 +76,7 @@ def _save_job(job: dict) -> None:
 
     md = U.render_md(utts, job["source"], job.get("duration", 0.0), job.get("meta_line", ""))
     output.write_text(job_dir, "transcript.md", md)
+    output.write_text(job_dir, "文字起こし.md", _plain_md(job))
     cues = U.build_cues(utts, sub)
     output.write_text(job_dir, "transcript.srt", U.cues_to_srt(cues, sub.get("speaker_prefix", False)))
     output.write_text(job_dir, "transcript.vtt", U.cues_to_vtt(cues, sub.get("speaker_prefix", False)))
@@ -114,6 +116,26 @@ def _read_md(job: dict, name: str) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
+def _plain_md(job: dict) -> str:
+    return U.render_md(job["utterances"], job["source"], job.get("duration", 0.0),
+                       job.get("meta_line", ""), plain=True)
+
+
+def _finalize_text(utts: list[dict], people_list: list) -> None:
+    """人名の別名・用語の直し・「ー」→「一」を発話テキストに反映する"""
+    for u in utts:
+        u["marked"] = U.fix_ichi(glossary.apply_corrections(people.apply_aliases(u["marked"], people_list)))
+        u["text"] = U.strip_marks(u["marked"])
+
+
+def _download_transcript(job: dict):
+    """タグなしの文字起こし.md を渡す（以前のジョブで未作成なら今作る）"""
+    job_dir = Path(job["job_dir"])
+    if not (job_dir / "文字起こし.md").exists() and job["utterances"]:
+        output.write_text(job_dir, "文字起こし.md", _plain_md(job))
+    return _download(job, "文字起こし.md")
+
+
 def _download(job: dict, name: str):
     path = Path(job["job_dir"]) / name
     if path.exists():
@@ -146,9 +168,9 @@ def _job_views(job: dict):
     """結果表示コンポーネント一式の更新値"""
     return (
         U.render_html(job["utterances"], _file_url(job.get("audio_path"))),
-        _read_md(job, "議事録.md") or "_議事録はまだありません（LLM設定を確認して「議事録・要約を作り直す」を押してください）_",
-        _read_md(job, "要約と考察.md") or "_要約と考察はまだありません_",
-        _download(job, "transcript.md"),
+        _read_md(job, "議事録.md") or "_議事録はまだありません（文字起こしを確認・修正してから「③ 📋 議事録を作る」を押してください）_",
+        _read_md(job, "要約と考察.md") or "_要約と考察はまだありません（「💡 要約と考察を作る」で作成）_",
+        _download_transcript(job),
         _download(job, "議事録.md"),
         _download(job, "transcript.srt"),
         _speaker_rows(job),
@@ -207,9 +229,7 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
     fillers = 0
     if opts.get("fillers", True):
         utts, fillers = U.remove_fillers(utts, threshold)
-    for u in utts:
-        u["marked"] = glossary.apply_corrections(people.apply_aliases(u["marked"], people_list))
-        u["text"] = U.strip_marks(u["marked"])
+    _finalize_text(utts, people_list)
 
     speed_label = dict((v, k) for k, v in transcriber.SPEED_CHOICES).get(result.get("speed"), "")
     meta_line = f"モデル: {result.get('model')}（{result.get('device')}・{speed_label.split('（')[0]}）"
@@ -238,43 +258,6 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
     return job
 
 
-def _llm_one(job: dict, opts: dict, settings: dict, sub) -> None:
-    """フェーズ2: LLM校正 → 議事録 → 要約（GPU: Ollama）"""
-    job_dir = Path(job["job_dir"])
-    if opts["proofread"]:
-        try:
-            done, changed = minutes.proofread_utterances(
-                settings, job["utterances"],
-                progress_cb=lambda f: sub(0.4 * f, f"AI校正中... {int(f * 100)}%"))
-            _save_job(job)
-            job["proofread"] = f"{done}発言を校正（{changed}発言を修正）"
-        except llm.LLMError as e:
-            _save_job(job)  # 途中まで校正できた分も保存して表示と一致させる
-            job["errors"].append(f"校正スキップ: {e}")
-
-    transcript = minutes.transcript_for_llm(job["utterances"])
-    if job.get("memo"):
-        transcript = f"（会議メモ: {job['memo']}）\n\n" + transcript
-    if opts["minutes"]:
-        sub(0.45, "議事録を作成中...")
-        try:
-            md = minutes.generate_minutes(settings, transcript, job["source"], job.get("meeting_date", ""))
-            output.write_text(job_dir, "議事録.md", md)
-        except llm.LLMError as e:
-            job["errors"].append(f"議事録スキップ: {e}")
-    if opts["insights"]:
-        sub(0.8, "要約と考察を作成中...")
-        try:
-            md = minutes.generate_insights(settings, transcript, job["source"], job.get("meeting_date", ""))
-            output.write_text(job_dir, "要約と考察.md", md)
-        except llm.LLMError as e:
-            job["errors"].append(f"要約スキップ: {e}")
-    notice = llm.pop_fallback_notice()
-    if notice:
-        job["errors"].append(notice)
-    sub(1.0, "完了")
-
-
 def _write_meta(job: dict, opts: dict, settings: dict) -> None:
     output.write_meta(Path(job["job_dir"]), {
         "source": job["source"],
@@ -291,24 +274,22 @@ def _write_meta(job: dict, opts: dict, settings: dict) -> None:
     })
 
 
-def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on, do_proofread,
-              do_minutes, do_insights, meeting_date, memo, progress=gr.Progress()):
+def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on,
+              meeting_date, memo, progress=gr.Progress()):
+    """① 音声 → 文字起こし（話者識別まで）。AIの校正・議事録は②③で別に行う"""
     if not files:
         return ("⚠️ ファイルを選択してください。", gr.update()) + \
             tuple(gr.update() for _ in range(8)) + (gr.update(),)
 
     settings = config.load_settings()
-    use_llm = (do_proofread or do_minutes or do_insights) and settings["llm"]["provider"] != "none"
     opts = {
         "model": model_name, "speed": speed, "language": language, "num_speakers": num_speakers,
-        "noise": noise, "eq": eq_on, "fillers": fillers_on, "diarize": diarize_on, "proofread": do_proofread,
-        "minutes": do_minutes, "insights": do_insights, "use_llm": use_llm,
+        "noise": noise, "eq": eq_on, "fillers": fillers_on, "diarize": diarize_on, "use_llm": False,
         "meeting_date": (meeting_date or "").strip(), "memo": (memo or "").strip(),
     }
     paths = [f if isinstance(f, str) else f.name for f in files]
     n = len(paths)
-    # 進捗配分: 文字起こし 0〜(0.55 or 1.0)、LLM 残り
-    t_share = 0.55 if use_llm else 1.0
+    t_share = 1.0
 
     # 前回のLLM(gemma4:31b)がメモリに残っているとWhisperが読み込めないため先に解放
     llm.unload_ollama(settings)
@@ -325,20 +306,6 @@ def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fi
         except Exception as e:
             logging.error(traceback.format_exc())
             failures.append(f"❌ {name}: {e}")
-
-    if use_llm and jobs:
-        # Whisper・声紋モデルをVRAMから降ろして、LLM(gemma4)にGPUを譲る
-        transcriber.unload()
-        diarization.unload()
-        for i, job in enumerate(jobs):
-            def sub(frac, desc, i=i, name=job["source"]):
-                progress(t_share + (1 - t_share) * (i + frac) / len(jobs),
-                         desc=f"[{i + 1}/{len(jobs)}] {name}: {desc}")
-            try:
-                _llm_one(job, opts, settings, sub)
-            except Exception as e:
-                logging.error(traceback.format_exc())
-                job["errors"].append(f"LLM処理エラー: {e}")
 
     for job in jobs:
         _write_meta(job, opts, settings)
@@ -360,6 +327,10 @@ def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fi
         for err in job["errors"]:
             lines.append(f"　⚠️ {err}")
     lines.extend(failures)
+    if jobs:
+        lines.append("**次は ② 確認・修正**: 右の文字起こしを見て、話者名と内容を直してください"
+                     "（「✍️ AI校正」で誤変換をAIに直させることもできます）。"
+                     "直し終わったら「③ 📋 議事録を作る」。")
     summary = "\n\n".join(lines)
 
     if not jobs:
@@ -411,9 +382,7 @@ def rediarize_job(state, num_speakers, progress=gr.Progress()):
     threshold = settings.get("postprocess", {}).get("red_threshold", 0.5)
     people_list = people.load_people()
     utts = U.build_utterances(segments, word_speakers, threshold)
-    for u in utts:
-        u["marked"] = glossary.apply_corrections(people.apply_aliases(u["marked"], people_list))
-        u["text"] = U.strip_marks(u["marked"])
+    _finalize_text(utts, people_list)
     job["utterances"] = utts
     job["cluster_embeddings"] = {k: v.tolist() for k, v in cluster_embeddings.items()}
     _save_job(job)
@@ -422,7 +391,37 @@ def rediarize_job(state, num_speakers, progress=gr.Progress()):
            + (f"\n\n🔊 声紋で自動認識: " + "、".join(f"{k}（{v:.2f}）" for k, v in matched.items())
               if matched else "")
            + "\n\n※ 文字は音声認識の結果から作り直しました（AI校正・手修正は反映されていません）。"
-             "議事録に反映するには「🔁 議事録・要約を作り直す」を押してください。")
+             "議事録に反映するには「③ 📋 議事録を作る」を押してください。")
+    return (msg, job) + _job_views(job)
+
+
+def reflow_job(state):
+    """保存済みの結果を、今の句読点・話者まとめ規則で組み直す（GPU不要ですぐ終わる）"""
+    none = tuple(gr.update() for _ in range(8))
+    if not state:
+        return ("⚠️ 先に文字起こしを実行するか、過去の結果を開いてください。", gr.update()) + none
+    job = state
+    people_list = people.load_people()
+    edited = U.count_edited(job["utterances"], lambda t: U.fix_ichi(
+        glossary.apply_corrections(people.apply_aliases(t, people_list))))
+    if edited and not job.get("_reflow_confirm"):
+        job["_reflow_confirm"] = True
+        return (f"⚠️ この結果は {edited} 件の発言がAI校正または手修正されています。"
+                "整え直すと文字は音声認識の結果に戻り、それらの修正は消えます。"
+                "\n\nそれでもよければ、もう一度ボタンを押してください"
+                "（おすすめ: 先に整え直してから「✍️ AI校正」をかける）。",
+                job) + none
+    job.pop("_reflow_confirm", None)
+    settings = config.load_settings()
+    threshold = settings.get("postprocess", {}).get("red_threshold", 0.5)
+    before = len(U.sentence_rows(job["utterances"]))
+    utts = U.reflow(job["utterances"], threshold)
+    _finalize_text(utts, people_list)
+    job["utterances"] = utts
+    _save_job(job)
+    msg = (f"✅ 文の区切り・句読点を整え直しました（{before} 行 → {len(U.sentence_rows(utts))} 行）"
+           "\n\n※ 文字は音声認識の結果から作り直しました（AI校正・手修正は反映されていません）。"
+           "議事録に反映するには「③ 📋 議事録を作る」を押してください。")
     return (msg, job) + _job_views(job)
 
 
@@ -430,29 +429,101 @@ def refresh_history():
     return gr.update(choices=output.list_editable_jobs())
 
 
-def regenerate_llm(state, do_proofread, progress=gr.Progress()):
-    none = tuple(gr.update() for _ in range(8))
+def _llm_ready(state):
+    """②③の共通チェック。問題があればメッセージを返す"""
     if not state:
-        return ("⚠️ 先に文字起こしを実行するか、過去の結果を開いてください。", gr.update()) + none
-    settings = config.load_settings()
-    if settings["llm"]["provider"] == "none":
-        return ("⚠️ 設定タブでLLMを選択してください。", gr.update()) + none
+        return "⚠️ 先に文字起こしを実行するか、過去の結果を開いてください。"
+    if config.load_settings()["llm"]["provider"] == "none":
+        return "⚠️ 設定タブでLLMを選択してください。"
+    # Whisper・声紋モデルをVRAMから降ろして、LLM(gemma4)にGPUを譲る
     transcriber.unload()
     diarization.unload()
-    job = dict(state, errors=[])
-    opts = {"proofread": do_proofread, "minutes": True, "insights": True}
+    return ""
+
+
+def _eta(started: float, frac: float) -> str:
+    if frac <= 0.02 or frac >= 1:
+        return ""
+    rest = (time.time() - started) * (1 - frac) / frac
+    if rest >= 3600:
+        return f"（残り約{int(rest // 3600)}時間{int(rest % 3600 // 60)}分）"
+    return f"（残り約{max(1, int(rest // 60))}分）"
+
+
+def proofread_job(state, redo, progress=gr.Progress()):
+    """② AI校正。校正済み・手修正済みの発言は飛ばすので、途中で止まっても続きから再開できる"""
+    none = tuple(gr.update() for _ in range(8))
+    err = _llm_ready(state)
+    if err:
+        return (err, gr.update()) + none
+    job = state
+    settings = config.load_settings()
+    if redo:
+        for u in job["utterances"]:
+            u.pop("proofread", None)
+
+    people_list = people.load_people()
+
+    def norm(t):
+        return U.fix_ichi(glossary.apply_corrections(people.apply_aliases(t, people_list)))
+
+    def skip(u):
+        # 校正済み・手修正済み（本文が音声認識の結果と違う＝以前の版で手で直した分も含む）は触らない
+        return bool(u.get("proofread") or u.get("human") or U.count_edited([u], norm))
+
+    todo = sum(1 for u in job["utterances"] if not skip(u))
+    if not todo:
+        return ("✅ すべての発言を校正済みです（最初からやり直す場合は「校正済みもやり直す」にチェック）",
+                job) + _job_views(job)
+    started = time.time()
+    progress(0, desc=f"AI校正の準備中...（対象 {todo} 発言）")
     try:
-        _llm_one(job, opts, settings, lambda f, d: progress(f, desc=d))
-    except Exception as e:
-        logging.error(traceback.format_exc())
-        job["errors"].append(f"LLM処理エラー: {e}")
-    msg = "✅ 議事録・要約を作り直しました"
-    if job.get("proofread"):
-        msg += f"（{job['proofread']}）"
-    if job["errors"]:
-        msg += "\n\n" + "\n\n".join(f"⚠️ {e}" for e in job["errors"])
-    job.pop("errors", None)
+        done, changed = minutes.proofread_utterances(
+            settings, job["utterances"], skip=skip, on_chunk=lambda: _save_job(job),
+            progress_cb=lambda f: progress(f, desc=f"AI校正中... {int(f * 100)}%{_eta(started, f)}"))
+        msg = f"✅ AI校正が終わりました（{done}発言を確認、{changed}発言を修正）"
+    except llm.LLMError as e:
+        msg = f"⚠️ AI校正を途中で止めました: {e}\n\nここまでの結果は保存済みです。もう一度押すと続きから再開します。"
+    _save_job(job)
+    notice = llm.pop_fallback_notice()
+    if notice:
+        msg += f"\n\n⚠️ {notice}"
+    msg += "\n\n直し終わったら「③ 📋 議事録を作る」を押してください。"
     return (msg, job) + _job_views(job)
+
+
+def _make_doc(state, kind: str, progress):
+    none = tuple(gr.update() for _ in range(8))
+    err = _llm_ready(state)
+    if err:
+        return (err, gr.update()) + none
+    job = state
+    settings = config.load_settings()
+    transcript = minutes.transcript_for_llm(job["utterances"])
+    if job.get("memo"):
+        transcript = f"（会議メモ: {job['memo']}）\n\n" + transcript
+    label, filename, fn = (("議事録", "議事録.md", minutes.generate_minutes) if kind == "minutes"
+                           else ("要約と考察", "要約と考察.md", minutes.generate_insights))
+    progress(0.1, desc=f"{label}を作成中...（長い会議は区間ごとのメモを作ってからまとめます）")
+    try:
+        md = fn(settings, transcript, job["source"], job.get("meeting_date", ""))
+        output.write_text(Path(job["job_dir"]), filename, md)
+        msg = f"✅ {label}を作りました（上の「{label}」タブで確認・📥 からダウンロード）"
+    except llm.LLMError as e:
+        msg = f"⚠️ {label}を作れませんでした: {e}"
+    notice = llm.pop_fallback_notice()
+    if notice:
+        msg += f"\n\n⚠️ {notice}"
+    return (msg, job) + _job_views(job)
+
+
+def make_minutes(state, progress=gr.Progress()):
+    """③ 今の文字起こし（②で直した後）から、テンプレートに沿った議事録を作る"""
+    return _make_doc(state, "minutes", progress)
+
+
+def make_insights(state, progress=gr.Progress()):
+    return _make_doc(state, "insights", progress)
 
 
 # =====================================================================
@@ -501,7 +572,7 @@ def assign_speakers(rows, save_voice, state):
     msg = f"✅ 話者を確定しました: {'、'.join(done)}"
     if saved:
         msg += f"\n\n🔊 声紋を保存しました（{'、'.join(saved)}）。次回から自動で名前が付きます。"
-    msg += "\n\n議事録に反映するには「🔁 議事録・要約を作り直す」を押してください。"
+    msg += "\n\n議事録に反映するには「③ 📋 議事録を作る」を押してください。"
     return (msg, job) + _job_views(job)
 
 
@@ -530,6 +601,7 @@ def save_utterance_edits(rows, state):
             learned += glossary.learn_from_diff(old_text, text)
             u["text"] = text
             u["marked"] = text  # 人が確認した文は赤字を解除
+            u["human"] = True  # AI校正で上書きしない
             changed += 1
         if speaker != (old_sp or ""):
             u["speaker"] = speaker
@@ -947,12 +1019,9 @@ def build_ui():
                             diarize_cb = gr.Checkbox(
                                 value=dia_available, interactive=dia_available,
                                 label="話者識別・声紋照合" + ("" if dia_available else "（未導入）"))
-                            proofread_cb = gr.Checkbox(
-                                value=settings["postprocess"]["proofread"],
-                                label="AI校正（誤変換を文脈で修正・推測箇所は赤字）")
-                            minutes_cb = gr.Checkbox(value=True, label="議事録を作成")
-                            insights_cb = gr.Checkbox(value=True, label="要約と考察を作成")
-                        start_btn = gr.Button("🚀 文字起こし開始", variant="primary", size="lg")
+                        start_btn = gr.Button("① 🚀 文字起こし開始", variant="primary", size="lg")
+                        gr.Markdown("<small>①は音声の文字起こしと話者識別だけを行います。"
+                                    "AI校正（②）と議事録（③）は、確認・修正のあと右側のボタンで別に実行します。</small>")
                         result_md = gr.Markdown(elem_id="st-summary")
                         with gr.Row():
                             history_dd = gr.Dropdown(
@@ -961,6 +1030,8 @@ def build_ui():
                             history_refresh = gr.Button("🔄", scale=1, min_width=40)
                         rediarize_btn = gr.Button("👥 話者識別だけやり直す（上の「話者の人数」を使用）",
                                                   size="sm")
+                        reflow_btn = gr.Button("✂️ 文の区切り・句読点を整え直す（数秒・音声解析なし）",
+                                               size="sm")
 
                     with gr.Column(scale=7):
                         with gr.Row(elem_classes="st-dl"):
@@ -978,6 +1049,7 @@ def build_ui():
                             with gr.Tab("💡 要約と考察"):
                                 insights_view = gr.Markdown()
 
+                        gr.Markdown("### ② 確認・修正")
                         with gr.Accordion("👥 話者に名前を付ける（声紋を覚えて次回から自動認識）", open=True):
                             gr.Markdown("「名前」列に正式な名前を入力 → 確定。"
                                         "登録済み人物は自動で名前が付いています。")
@@ -988,7 +1060,6 @@ def build_ui():
                             with gr.Row():
                                 save_voice_cb = gr.Checkbox(value=True, label="声紋として保存する")
                                 assign_btn = gr.Button("✅ 話者を確定", variant="primary")
-                            regen_btn = gr.Button("🔁 議事録・要約を作り直す（話者名の反映・AI校正）")
                             assign_status = gr.Markdown()
 
                         with gr.Accordion("✏️ 発言を修正（直した言葉は学習して次回から自動で直ります）",
@@ -1002,6 +1073,18 @@ def build_ui():
                             )
                             save_edit_btn = gr.Button("💾 修正を保存して学習", variant="primary")
                             edit_status = gr.Markdown()
+                        with gr.Row():
+                            proofread_btn = gr.Button("✍️ AI校正（誤変換を文脈で直す・途中からでも再開できる）",
+                                                      scale=3)
+                            redo_cb = gr.Checkbox(value=False, label="校正済みもやり直す", scale=1)
+                        proofread_status = gr.Markdown()
+
+                        gr.Markdown("### ③ 議事録")
+                        gr.Markdown("<small>②で直した今の文字起こしから、`議事録テンプレート.md` の形で作ります。</small>")
+                        with gr.Row():
+                            minutes_btn = gr.Button("📋 議事録を作る", variant="primary", scale=2)
+                            insights_btn = gr.Button("💡 要約と考察を作る", scale=1)
+                        doc_status = gr.Markdown()
 
             # ======================== SRT編集 ========================
             with gr.Tab("🎬 字幕(SRT)編集"):
@@ -1190,7 +1273,7 @@ def build_ui():
         start_btn.click(
             fn=run_batch,
             inputs=[files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, eq_cb, fillers_cb, diarize_cb,
-                    proofread_cb, minutes_cb, insights_cb, meeting_date_box, memo_box],
+                    meeting_date_box, memo_box],
             outputs=[result_md, job_state] + view_outputs + [history_dd],
         ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
 
@@ -1201,14 +1284,21 @@ def build_ui():
         rediarize_btn.click(fn=rediarize_job, inputs=[job_state, num_spk_dd],
                             outputs=[result_md, job_state] + view_outputs
                             ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
+        reflow_btn.click(fn=reflow_job, inputs=job_state,
+                         outputs=[result_md, job_state] + view_outputs
+                         ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
 
         assign_btn.click(fn=assign_speakers, inputs=[speaker_table, save_voice_cb, job_state],
                          outputs=[assign_status, job_state] + view_outputs
                          ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor
                                 ).then(fn=_voiceprint_rows, outputs=vp_table)
-        regen_btn.click(fn=regenerate_llm, inputs=[job_state, proofread_cb],
-                        outputs=[assign_status, job_state] + view_outputs
-                        ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
+        proofread_btn.click(fn=proofread_job, inputs=[job_state, redo_cb],
+                            outputs=[proofread_status, job_state] + view_outputs
+                            ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
+        minutes_btn.click(fn=make_minutes, inputs=job_state,
+                          outputs=[doc_status, job_state] + view_outputs)
+        insights_btn.click(fn=make_insights, inputs=job_state,
+                           outputs=[doc_status, job_state] + view_outputs)
         save_edit_btn.click(fn=save_utterance_edits, inputs=[edit_table, job_state],
                             outputs=[edit_status, job_state] + view_outputs
                             ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)

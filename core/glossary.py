@@ -11,6 +11,22 @@ LEARNED_PATH = CORRECTIONS_DIR / "learned_words.yaml"
 # 学習した修正を自動適用するのに必要な出現回数（誤学習防止）
 PROMOTE_COUNT = 2
 
+# 句読点・記号。これを含む修正は「その場の文の直し」で、他の文に当てはめると壊れる
+# （「。」→「、」を覚えて全文の句点が消えた事例あり）
+_PUNCT_CHARS = set("、。，．,.？！?!・…「」『』（）()　 ")
+
+
+def _learnable(wrong: str, right: str) -> bool:
+    """他の文字起こしにも自動で当てはめてよい「誤→正」か。
+    句読点を含むもの・1文字だけの置換（「ー」→「ン」など）は文脈次第なので覚えない。"""
+    if not wrong or not right or wrong == right:
+        return False
+    if len(wrong) > 12 or len(right) > 12 or "\n" in wrong or "\n" in right:
+        return False
+    if _PUNCT_CHARS & (set(wrong) | set(right)):
+        return False
+    return len(wrong) >= 2
+
 
 def load_glossary() -> list[str]:
     if GLOSSARY_PATH.exists():
@@ -59,10 +75,8 @@ def learn_from_diff(before: str, after: str) -> int:
             continue
         wrong = before[i1:i2].strip()
         right = after[j1:j2].strip()
-        # 短い語句の置換のみ学習対象（文まるごとの書き換えは学習しない）
-        if not wrong or not right or len(wrong) > 12 or len(right) > 12:
-            continue
-        if "\n" in wrong or "\n" in right or wrong == right:
+        # 短い語句の置換のみ学習対象（文まるごとの書き換え・句読点の直しは学習しない）
+        if not _learnable(wrong, right):
             continue
         key = (wrong, right)
         if key in index:
@@ -83,7 +97,7 @@ def apply_corrections(text: str) -> str:
     for c in load_corrections():
         if int(c.get("count", 0)) >= PROMOTE_COUNT:
             wrong, right = c.get("wrong"), c.get("right")
-            if wrong and right:
+            if _learnable(wrong, right):  # 以前の版で覚えた句読点の直し等は使わない
                 text = text.replace(wrong, right)
     return text
 
@@ -93,7 +107,7 @@ def build_initial_prompt(people_terms: list[str]) -> str:
     terms = load_glossary() + people_terms
     # 学習済み修正の「正しい語」もヒントに追加
     terms += [c["right"] for c in load_corrections()
-              if int(c.get("count", 0)) >= PROMOTE_COUNT and c.get("right")]
+              if int(c.get("count", 0)) >= PROMOTE_COUNT and _learnable(c.get("wrong"), c.get("right"))]
     seen = set()
     uniq = []
     for t in terms:

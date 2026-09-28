@@ -9,6 +9,8 @@
 import html
 import re
 
+from .punctuate import glue_word_heads
+
 RED_OPEN = '<span style="color:red">'
 RED_CLOSE = "</span>"
 RED_RE = re.compile(r'<span style="color:red">(.*?)</span>', re.DOTALL)
@@ -111,6 +113,55 @@ def _snap_segment_edges(words: list[dict], labels: list[str]) -> list[str]:
     return labels
 
 
+PHRASE_GAP = 0.3         # 単語間がこれ以上空いたら別のまとまり
+KEEP_MINOR_RUN_SEC = 1.5  # まとまりの中でもこれ以上続く別話者は本当の交代とみなして残す
+
+
+def _vote_phrase_speakers(words: list[dict], labels: list[str]) -> list[str]:
+    """話者を「句読点や間で区切ったまとまり」ごとに多数決で決める。
+    単語ごとに決めると、話者の境目が語の途中に来て「こから出て／るんですか？」のように
+    文が割れるため。まとまりの中で長く続く別話者（重なった発言など）だけは残す。"""
+    labels = list(labels)
+    n = len(words)
+    start = 0
+    for i in range(n):
+        last = i == n - 1
+        if not last:
+            ends = words[i]["word"].rstrip()[-1:] in SPLIT_PUNCT
+            if not ends and words[i + 1]["start"] - words[i]["end"] < PHRASE_GAP:
+                continue
+        span = range(start, i + 1)
+        start = i + 1
+        if len({labels[k] for k in span}) < 2:
+            continue
+        runs, k = [], span[0]
+        while k <= span[-1]:
+            j = k
+            while j + 1 <= span[-1] and labels[j + 1] == labels[k]:
+                j += 1
+            runs.append((k, j, words[j]["end"] - words[k]["start"]))
+            k = j + 1
+        dur = {}
+        for a, b, d in runs:
+            dur[labels[a]] = dur.get(labels[a], 0.0) + d
+        major = max(dur, key=dur.get)
+        for a, b, d in runs:
+            if labels[a] != major and d < KEEP_MINOR_RUN_SEC:
+                for k in range(a, b + 1):
+                    labels[k] = major
+    return labels
+
+
+# 「一番」「一緒」の「一」が長音「ー」になる誤認識。前がかな・カタカナなら本物の伸ばし棒なので触らない
+_ICHI_RE = re.compile(r"(?<![ぁ-ゖァ-ヺーｦ-ﾟa-zA-Zａ-ｚＡ-Ｚ])ー(?=[番緒応旦度回部方般斉括覧貫致切体瞬員式周層環同列連気杯歩段通人つ個件本枚点位種名時日年月週])")
+# 伸ばし棒の後にはまず来ない字（「けどー番」「がー緒に」）。前がひらがなでも「一」に直す
+_ICHI_STRONG_RE = re.compile(r"(?<![ァ-ヺーｦ-ﾟ])ー(?=[番緒応旦般斉括覧貫瞬])")
+
+
+def fix_ichi(text: str) -> str:
+    return _ICHI_STRONG_RE.sub("一", _ICHI_RE.sub("一", text or ""))
+
+
 def _marked_text(words: list[dict], threshold: float) -> str:
     parts, in_red = [], False
     for w in words:
@@ -164,8 +215,10 @@ def build_utterances(segments: list[dict], word_speakers: dict | None,
 
     if not flat_words:
         return []
+    glue_word_heads(flat_words, flat_labels)
     if word_speakers:
         flat_labels = _smooth_word_speakers(flat_words, flat_labels)
+        flat_labels = _vote_phrase_speakers(flat_words, flat_labels)
 
     utterances = []
     cur = None
@@ -191,6 +244,34 @@ def build_utterances(segments: list[dict], word_speakers: dict | None,
     for u in utterances:
         u.pop("last_seg", None)
     return [u for u in utterances if u["text"]]
+
+
+def count_edited(utterances: list[dict], normalize=None) -> int:
+    """本文が単語データ（音声認識の結果）と食い違う発言の数＝AI校正・手修正された発言。
+    normalize: 自動で掛かる置換（人名の別名・用語の直し）を単語側にも掛ける関数"""
+    clean = lambda s: re.sub(r"[\s、。？！?!，,]", "", s or "")
+    norm = normalize or (lambda s: s)
+    return sum(1 for u in utterances if u.get("words")
+               and clean(u.get("text")) != clean(norm("".join(w.get("word", "") for w in u["words"]))))
+
+
+def reflow(utterances: list[dict], threshold: float = 0.5) -> list[dict]:
+    """保存済みの発話を、今の句読点・話者まとめ規則で組み直す（音声の再解析なし）。
+    以前の話者は単語ごとのラベルとして引き継ぐ。文字は単語データから作り直すので、
+    AI校正・手修正の結果は元に戻る。"""
+    from .punctuate import repair_words
+
+    words, labels = [], []
+    for u in utterances:
+        for w in u.get("words") or []:
+            if w.get("word"):
+                words.append(dict(w))
+                labels.append(u.get("speaker", ""))
+    if not words:
+        return utterances
+    repair_words(words)
+    return build_utterances([{"start": words[0]["start"], "end": words[-1]["end"], "words": words}],
+                            {0: labels} if any(labels) else None, threshold)
 
 
 # =====================================================================
@@ -377,6 +458,13 @@ def sentence_rows(utterances: list[dict]) -> list[dict]:
                         frag += RED_CLOSE
                 else:
                     frag = text[lo:hi]
+                if rows and not text[lo:hi].strip(SPLIT_PUNCT) \
+                        and rows[-1]["speaker"] == u.get("speaker", ""):
+                    # 「。」だけの行は作らず前の行に付ける
+                    rows[-1]["text"] += text[lo:hi]
+                    rows[-1]["marked"] += text[lo:hi]
+                    start = cut
+                    continue
                 rows.append({"start": times[lo][0] if times else u["start"],
                              "end": times[hi - 1][1] if times else u["end"],
                              "speaker": u.get("speaker", ""),
@@ -396,7 +484,8 @@ def _fmt_dur(sec: float) -> str:
 
 
 def render_md(utterances: list[dict], source_name: str = "", duration: float = 0.0,
-              meta_line: str = "") -> str:
+              meta_line: str = "", plain: bool = False) -> str:
+    """plain=True なら赤字タグなし（ダウンロード用の読みやすい版）"""
     lines = []
     if source_name:
         lines.append(f"# 文字起こし: {source_name}")
@@ -419,16 +508,18 @@ def render_md(utterances: list[dict], source_name: str = "", duration: float = 0
             lines.append(f"| {sp} | {_fmt_dur(sec)} | {sec / total * 100:.0f}% | {cnt} |")
         lines.append("")
 
-    lines.append('※ <span style="color:red">赤字</span>は音声が不明瞭で認識の確信度が低い、'
-                 "またはAIが文脈から推測した箇所です。")
-    lines.append("")
+    if not plain:
+        lines.append('※ <span style="color:red">赤字</span>は音声が不明瞭で認識の確信度が低い、'
+                     "またはAIが文脈から推測した箇所です。")
+        lines.append("")
 
     # 1文ずつ「番号 / 時刻 / 話者: 本文」。Markdownで改行が消えないよう行末に2スペース
     for i, r in enumerate(sentence_rows(utterances), 1):
         lines.append(f"{i}  ")
         lines.append(f"{format_srt_time(r['start'])} --> {format_srt_time(r['end'])}  ")
         speaker = r.get("speaker") or ""
-        lines.append(f"**{speaker}:** {r['marked']}" if speaker else r["marked"])
+        body = strip_marks(r["marked"]) if plain else r["marked"]
+        lines.append(f"**{speaker}:** {body}" if speaker else body)
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
