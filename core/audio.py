@@ -28,8 +28,9 @@ def find_ffmpeg() -> str:
         )
 
 
-def prepare_audio(input_path: str, noise_reduction: bool = False) -> str:
-    """入力（音声/動画）を 16kHz モノラル wav に変換して一時ファイルパスを返す。
+def prepare_audio(input_path: str) -> str:
+    """入力（音声/動画）を 16kHz モノラル・音量を揃えた wav に変換して一時ファイルパスを返す。
+    話者分離・声紋登録/照合はこの音声を使う（文字起こし用の補正は enhance_for_asr）。
     音声トラックが無い場合はエラーメッセージ付きで失敗する。"""
     ffmpeg = find_ffmpeg()
     src = Path(input_path)
@@ -57,17 +58,44 @@ def prepare_audio(input_path: str, noise_reduction: bool = False) -> str:
             raise AudioError(f"音声トラックが見つかりません: {src.name}")
         raise AudioError(f"音声変換に失敗しました ({src.name}): {stderr[-500:]}")
 
-    if noise_reduction:
-        try:
-            out_path = _denoise(out_path)
-        except Exception as e:
-            logging.warning(f"ノイズ除去に失敗したためスキップします: {e}")
-
     return out_path
 
 
+# Whisper用イコライザー: 空調・机の振動などの低音(80Hz未満)と、声に無い高域(7kHz超)を落とす
+ASR_EQ = "highpass=f=80,lowpass=f=7000"
+
+
+def enhance_for_asr(wav_path: str, eq: bool = True, noise_reduction: bool = False) -> str:
+    """文字起こし(Whisper)専用に聞き取りやすくした別ファイルを作って返す。
+    話者分離・声紋照合は声質を変えないよう prepare_audio の音声をそのまま使うこと。
+    何もしない設定なら元のパスを返す（呼び出し側は戻り値 != wav_path の時だけ削除する）。
+    時間軸は変えない（無音を切らない）ので、タイムスタンプは元音声とそのまま一致する。"""
+    if not (eq or noise_reduction):
+        return wav_path
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    out_path = tmp.name
+    try:
+        if eq:
+            proc = subprocess.run(
+                [find_ffmpeg(), "-y", "-i", wav_path, "-af", ASR_EQ, "-acodec", "pcm_s16le", out_path],
+                capture_output=True, text=True, errors="replace")
+            if proc.returncode != 0:
+                raise AudioError(proc.stderr[-300:])
+        else:
+            shutil.copyfile(wav_path, out_path)
+        if noise_reduction:
+            _denoise(out_path)
+        return out_path
+    except Exception as e:
+        logging.warning(f"文字起こし用の音声補正に失敗したため元の音声を使います: {e}")
+        Path(out_path).unlink(missing_ok=True)
+        return wav_path
+
+
 def _denoise(wav_path: str) -> str:
-    """DeepFilterNet があれば優先、無ければ noisereduce でスペクトラルゲート。
+    """DeepFilterNet があれば優先（全体を一度に・既定の強さで処理）、無ければ noisereduce で
+    弱めのスペクトラルゲート。
     どちらも失敗したら元ファイルを返す（呼び出し側でwarning済み）。"""
     # 1) DeepFilterNet（高品質・任意インストール）
     try:
@@ -84,9 +112,20 @@ def _denoise(wav_path: str) -> str:
     # 2) noisereduce（標準同梱）
     import noisereduce as nr
     import soundfile as sf
-    data, rate = sf.read(wav_path)
-    reduced = nr.reduce_noise(y=data, sr=rate, stationary=False, prop_decrease=0.9)
-    sf.write(wav_path, reduced, rate)
+    import numpy as np
+    info = sf.info(wav_path)
+    rate, total = info.samplerate, info.frames
+    # 長時間録音でもメモリを食わないよう5分ずつ処理（前後2秒の余白を付けて継ぎ目を目立たなくする）
+    block, pad = rate * 300, rate * 2
+    out = np.empty(total, dtype=np.float32)
+    for start in range(0, total, block):
+        a, b = max(0, start - pad), min(total, start + block + pad)
+        data, _ = sf.read(wav_path, start=a, stop=b, dtype="float32")
+        # 強く掛けると声まで削れて認識文字数が約7%減った（実会議録音）。控えめに掛ける
+        reduced = nr.reduce_noise(y=data, sr=rate, stationary=False, prop_decrease=0.5)
+        end = min(start + block, total)
+        out[start:end] = reduced[start - a:start - a + (end - start)]
+    sf.write(wav_path, out, rate, subtype="PCM_16")
     logging.info("ノイズ除去: noisereduce を使用しました")
     return wav_path
 

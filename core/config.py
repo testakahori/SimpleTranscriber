@@ -34,11 +34,13 @@ DEFAULTS = {
         "speed": "accurate",  # accurate | balanced | fast
     },
     "audio": {
-        "noise_reduction": False,
+        "asr_eq": True,            # 文字起こし前に低音(80Hz未満)・高域(7kHz超)をカット
+        "noise_reduction": True,   # 背景ノイズ除去（弱め。4時間で約1.5分増）
     },
     "postprocess": {
         "red_threshold": 0.5,   # この確信度未満の単語を赤字対象にする
         "proofread": True,      # LLMによる校正・文脈補完
+        "remove_fillers": True, # 「えー」「えーっと」「うーん」などを消す
     },
     "diarization": {
         "enabled": True,          # ライブラリ未導入なら自動でスキップ

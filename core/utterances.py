@@ -193,6 +193,72 @@ def build_utterances(segments: list[dict], word_speakers: dict | None,
     return [u for u in utterances if u["text"]]
 
 
+# =====================================================================
+# フィラー除去
+# =====================================================================
+
+# 意味を持たない言いよどみだけを対象にする。「その」「なんか」「まあ」「あの（＋名詞）」
+# 「ええ（=はい）」は意味を持つことが多いので残す。
+# 直前が同じ母音で終わるかな（「へえー」「じゃあー」など）の時は語の伸ばしとみなして残す
+# 直前が漢字なら送り仮名（「考えー」「答えー」）とみなして残す
+_NOT_E_ROW = r"(?<![えけげせぜてでねへべぺめれ一-鿿々])"
+_NOT_A_ROW = r"(?<![あかがさざただなはばぱまやゃらわ一-鿿々])"
+FILLER_RE = re.compile(
+    rf"(?:{_NOT_E_ROW}(?:え[ーぇ]+っ?と|えっと"            # えーと / えーっと / えっと
+    r"|えー+(?![ーっ]*[！!？?]))"                          # えー（驚きの「えーっ！」は残す）
+    r"|ええと|あの[ーぉ]+"                                  # ええと / あのー
+    rf"|{_NOT_A_ROW}あ[ーぁ]+(?!いう|いっ|やっ|やる|して|する|なる|なっ)"  # あー（「あーいう」は残す）
+    r"|う[ーぅ]+ん|(?<![^\s、。？！?!])ん[ーん]+)"           # うーん / (文頭の)んー
+    r"[ーっ]*[、，,]?"
+)
+
+
+def remove_fillers(utterances: list[dict], threshold: float = 0.5) -> tuple[list[dict], int]:
+    """「えー」「えーっと」「うーん」などを単語単位で消す（時刻・赤字情報は保つ）。
+    フィラーだけの発話は丸ごと消す。Returns: (発話リスト, 消したフィラー数)"""
+    removed = 0
+    out = []
+    for u in utterances:
+        words = [dict(w) for w in (u.get("words") or []) if w.get("word")]
+        joined = "".join(w["word"] for w in words)
+        spans = [m.span() for m in FILLER_RE.finditer(joined)]
+        if not spans:
+            out.append(u)
+            continue
+        drop = set()
+        for a, b in spans:
+            drop.update(range(a, b))
+        removed += len(spans)
+        pos = 0
+        for w in words:
+            n = len(w["word"])
+            w["word"] = "".join(ch for k, ch in enumerate(w["word"]) if pos + k not in drop)
+            pos += n
+        words = [w for w in words if w["word"].strip()]
+        # 文頭・句読点の直後に残った「、」を掃除
+        prev = ""
+        for w in words:
+            s = w["word"]
+            while s[:1] in "、，," and (not prev or prev[-1:] in "、，,。？！?! "):
+                s = s[1:]
+            w["word"] = s
+            prev = (prev + s)[-1:] if s else prev
+        words = [w for w in words if w["word"].strip()]
+        # 「そうですね、えー。」→「そうですね、。」にならないよう、文末記号・発話末の前の「、」も消す
+        for i, w in enumerate(words):
+            nxt = words[i + 1]["word"][:1] if i + 1 < len(words) else ""
+            if w["word"][-1:] in "、，," and (not nxt or nxt in "。？！?!"):
+                w["word"] = w["word"][:-1]
+        words = [w for w in words if w["word"].strip()]
+        if not words:
+            continue
+        v = dict(u, words=words)
+        _finish(v, threshold)
+        if v["text"]:
+            out.append(v)
+    return out, removed
+
+
 def rename_speaker(utterances: list[dict], old: str, new: str) -> int:
     n = 0
     for u in utterances:

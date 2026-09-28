@@ -15,3 +15,9 @@ output/
 profiles/
 corrections/
 settings.yaml
+
+# Original meeting audio (never commit)
+motonoonsei/
+
+# Voice samples for voiceprint enrollment (real people, never commit)
+seimon/
