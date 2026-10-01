@@ -269,7 +269,7 @@ def reflow(utterances: list[dict], threshold: float = 0.5) -> list[dict]:
                 labels.append(u.get("speaker", ""))
     if not words:
         return utterances
-    repair_words(words)
+    repair_words(words, labels)
     return build_utterances([{"start": words[0]["start"], "end": words[-1]["end"], "words": words}],
                             {0: labels} if any(labels) else None, threshold)
 

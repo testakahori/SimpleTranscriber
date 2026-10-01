@@ -26,7 +26,10 @@ HOP_SEC = 0.75
 MIN_WIN_SEC = 0.5        # これより短い発話区間は声紋を取らない（前後の窓で補完）
 REGION_GAP_SEC = 0.6     # 単語間の隙間がこれ以下なら同じ発話区間とみなす
 MIN_CLUSTER_SEC = 3.0    # 合計発話がこれ未満のクラスタは近いクラスタへ吸収（ノイズ対策）
-MAX_PROFILE_SAMPLES = 60  # 1人あたり保存する声紋ベクトル数の上限
+MAX_PROFILE_SAMPLES = 400  # 1人あたり保存する声紋ベクトル数の上限（古い会議の分から捨てる）
+LEARN_PER_JOB = 30        # 1会議から1人あたり学習する声紋ベクトル数
+WEAK_MATCH_FLOOR = 0.30   # これ未満の類似度では、他と差があっても同じ人物と判定しない
+MATCH_MARGIN = 0.08       # しきい値未満の時、2番目に近い候補とこれだけ差があれば確定
 
 
 def available() -> bool:
@@ -331,16 +334,29 @@ def _recheck_long_segments(data, segments, word_speakers, centroids, cluster_nam
 def _name_clusters(centroids: dict, order: list, match_similarity: float):
     """クラスタ → 表示名。声紋DBと照合（類似度の高い組から貪欲に確定し、同じ人物が
     2クラスタに付かないようにする）。未知話者は登場順に 話者A, 話者B...
+
+    別の会議・別の日の録音では同じ人でも類似度が 0.35〜0.7 程度まで下がる（実測）ので、
+    match_similarity 以上なら確定、それ未満でも WEAK 以上で「他の人物・他の話者より
+    はっきり近い（差 MATCH_MARGIN 以上）」なら確定する。声紋は会議ごとの塊で持ち、
+    いちばん近い会議の塊との類似度を使う（同じ部屋・同じマイクの会議ほど近い）。
     Returns: (cluster_names, matched)"""
-    known = load_voiceprints()
-    pairs = sorted(((float(cent @ vp), cid, name) for cid, cent in centroids.items()
-                    for name, vp in known.items()), reverse=True)
+    groups = load_voiceprint_groups()
+    score = {(cid, name): max(float(cent @ g) for g in vecs)
+             for cid, cent in centroids.items() for name, vecs in groups.items()}
+    weak = max(WEAK_MATCH_FLOOR, match_similarity - 0.2)
     cluster_names, used, matched = {}, set(), {}
-    for sim, cid, name in pairs:
-        if sim < match_similarity:
+    for (cid, name), sim in sorted(score.items(), key=lambda x: -x[1]):
+        if sim < weak:
             break
         if cid in cluster_names or name in used:
             continue
+        if sim < match_similarity:
+            rivals = [v for (c, n), v in score.items()
+                      if (c == cid and n != name and n not in used)
+                      or (n == name and c != cid and c not in cluster_names)]
+            # 比べる相手がいない（登録1人・話者1人）時は、しきい値未満では決めない
+            if not rivals or sim - max(rivals) < MATCH_MARGIN:
+                continue
         cluster_names[cid] = name
         used.add(name)
         matched[name] = round(sim, 3)
@@ -528,8 +544,8 @@ def _speaker_voiceprints(data, turns, max_sec: float = 90.0):
         if not chunks:
             continue
         vecs = _embed_chunks(chunks, batch_size=32)
-        m = vecs.mean(axis=0)
-        centroids[spk] = m / (np.linalg.norm(m) or 1.0)
+        # 重なった声・咳などの外れた切れ端を除いてから代表を作る（声紋DBとの照合が安定する）
+        centroids[spk] = _mean_unit(_best_vectors(vecs, len(vecs)))
     return centroids
 
 
@@ -607,22 +623,82 @@ def _load_profile_matrix(path: Path):
     return arr.astype("float32")
 
 
+def _tags_path(path: Path) -> Path:
+    return path.with_suffix(".json")
+
+
+def _load_profile(path: Path):
+    """声紋ファイル → (行列, 各行の出どころタグ)。タグ: "enroll"=登録音声 /
+    "job:<結果フォルダ名>"=その会議から学習 / "legacy"=タグ導入前の分"""
+    import json
+    mat = _load_profile_matrix(path)
+    tags = []
+    tp = _tags_path(path)
+    if tp.exists():
+        try:
+            tags = json.loads(tp.read_text(encoding="utf-8")).get("tags", [])
+        except Exception:
+            tags = []
+    if len(tags) != len(mat):
+        tags = ["legacy"] * len(mat)
+    return mat, tags
+
+
+def _save_profile(path: Path, mat, tags: list[str]) -> None:
+    import json
+
+    import numpy as np
+    VOICEPRINTS_DIR.mkdir(parents=True, exist_ok=True)
+    # 上限を超えたら、登録音声以外の古い会議の分から丸ごと捨てる
+    while len(mat) > MAX_PROFILE_SAMPLES:
+        # 会議から学習した分 → タグ導入前の分（昔の登録音声を含む）の順に捨てる
+        old = next((t for t in tags if t.startswith("job:")), None) or             next((t for t in tags if t != "enroll"), None)
+        keep = [i for i, t in enumerate(tags) if t != old] if old else []
+        if not old or len(keep) < MAX_PROFILE_SAMPLES // 2:  # 1会議分だけで大半を占める時は先頭から削る
+            keep = list(range(len(tags)))[-MAX_PROFILE_SAMPLES:]
+        mat, tags = mat[keep], [tags[i] for i in keep]
+    np.save(path, np.asarray(mat, dtype="float32"))
+    _tags_path(path).write_text(json.dumps({"tags": tags}, ensure_ascii=False), encoding="utf-8")
+
+
+def _normalize_rows(mat):
+    import numpy as np
+    return mat / np.maximum(np.linalg.norm(mat, axis=1, keepdims=True), 1e-8)
+
+
+def _mean_unit(mat):
+    import numpy as np
+    vec = _normalize_rows(mat).mean(axis=0)
+    return vec / (np.linalg.norm(vec) or 1.0)
+
+
 def load_voiceprints() -> dict:
     """profiles/voiceprints/*.npy → {名前: 正規化済み代表ベクトル}"""
-    import numpy as np
     prints = {}
     if VOICEPRINTS_DIR.exists():
         for f in VOICEPRINTS_DIR.glob("*.npy"):
             try:
-                mat = _load_profile_matrix(f)
-                mat = mat / np.maximum(np.linalg.norm(mat, axis=1, keepdims=True), 1e-8)
-                vec = mat.mean(axis=0)
-                norm = np.linalg.norm(vec)
-                if norm > 0:
-                    prints[f.stem] = vec / norm
+                prints[f.stem] = _mean_unit(_load_profile_matrix(f))
             except Exception:
                 continue
     return prints
+
+
+def load_voiceprint_groups() -> dict:
+    """{名前: [代表ベクトル（全体）, 出どころ（会議・登録音声）ごとの代表ベクトル...]}"""
+    groups = {}
+    if VOICEPRINTS_DIR.exists():
+        for f in VOICEPRINTS_DIR.glob("*.npy"):
+            try:
+                mat, tags = _load_profile(f)
+            except Exception:
+                continue
+            vecs = [_mean_unit(mat)]
+            if len(set(tags)) > 1:
+                for tag in dict.fromkeys(tags):
+                    vecs.append(_mean_unit(mat[[i for i, t in enumerate(tags) if t == tag]]))
+            groups[f.stem] = vecs
+    return groups
 
 
 def list_voiceprints() -> list[tuple[str, int]]:
@@ -637,30 +713,160 @@ def list_voiceprints() -> list[tuple[str, int]]:
     return rows
 
 
-def save_voiceprint(name: str, embeddings) -> int:
-    """声紋を追加保存（既存サンプルに追記）。保存後のサンプル数を返す。"""
+def save_voiceprint(name: str, embeddings, tag: str = "enroll") -> int:
+    """声紋を追加保存する。tag が "job:..." の時は、その会議から前に学習した分を置き換える
+    （同じ会議で何度学習しても重ならない）。保存後のサンプル数を返す。"""
     import numpy as np
-    VOICEPRINTS_DIR.mkdir(parents=True, exist_ok=True)
     path = _profile_path(name)
     new = np.asarray(embeddings, dtype="float32")
     if new.ndim == 1:
         new = new[None, :]
+    mat, tags = np.zeros((0, new.shape[1]), dtype="float32"), []
     if path.exists():
         try:
-            new = np.concatenate([_load_profile_matrix(path), new], axis=0)
+            mat, tags = _load_profile(path)
         except Exception:
             pass
-    new = new[-MAX_PROFILE_SAMPLES:]
-    np.save(path, new)
-    return int(new.shape[0])
+    if tag.startswith("job:"):
+        keep = [i for i, t in enumerate(tags) if t != tag]
+        mat, tags = mat[keep], [tags[i] for i in keep]
+    if mat.shape[1] != new.shape[1]:  # 声紋モデルが変わった・壊れたファイルは作り直す
+        mat, tags = mat[:0].reshape(0, new.shape[1]), []
+    mat = np.concatenate([mat, new], axis=0)
+    tags = tags + [tag] * len(new)
+    _save_profile(path, mat, tags)
+    return int(_load_profile_matrix(path).shape[0])
+
+
+def forget_job(tag: str) -> list[str]:
+    """全員の声紋から、その会議から学習した分を消す（話者の付け間違いを直した時用）"""
+    names = []
+    if VOICEPRINTS_DIR.exists():
+        for f in VOICEPRINTS_DIR.glob("*.npy"):
+            try:
+                mat, tags = _load_profile(f)
+            except Exception:
+                continue
+            keep = [i for i, t in enumerate(tags) if t != tag]
+            if len(keep) == len(tags):
+                continue
+            if keep:
+                _save_profile(f, mat[keep], [tags[i] for i in keep])
+            else:
+                f.unlink()
+                _tags_path(f).unlink(missing_ok=True)
+            names.append(f.stem)
+    return names
 
 
 def delete_voiceprint(name: str) -> bool:
     path = _profile_path(name)
     if path.exists():
         path.unlink()
+        _tags_path(path).unlink(missing_ok=True)
         return True
     return False
+
+
+# ---------------------------------------------------------------------
+# 会議からの声紋学習（議事録を取るたびに、よい音声だけを選んで声紋に足す）
+# ---------------------------------------------------------------------
+
+UNNAMED_RE = re.compile(r"^(話者([A-Z]|\d+)|不明|unknown|)$")
+EDGE_SEC = 0.25          # 発言の頭と終わりは前後の人の声・息が混ざりやすいので削る
+CLIP_SEC = 3.0           # 声紋を取る1切れの長さ
+MIN_CLIP_SEC = 1.5
+
+
+def is_named(speaker: str) -> bool:
+    """「話者A」のような仮の名前ではなく、人の名前が付いているか"""
+    return not UNNAMED_RE.match((speaker or "").strip()) and validate_name(speaker or "") is None
+
+
+def _clean_clips(utterances: list[dict], duration: float) -> dict:
+    """発言データから、1人だけが続けて話している区間を CLIP_SEC ずつ切り出す
+    → {話者名: [(開始, 終了)]}。単語の時刻で言いよどみの無音を避け、
+    話者が替わる前後・他の人の発言と重なる所は使わない。"""
+    utts = sorted((u for u in utterances if u.get("words")), key=lambda u: u["start"])
+    clips = {}
+    for k, u in enumerate(utts):
+        spk = u.get("speaker", "")
+        if not is_named(spk):
+            continue
+        lo = u["start"] + EDGE_SEC
+        hi = min(u["end"], duration) - EDGE_SEC
+        for j in (k - 1, k + 1):  # 隣の別の人の発言と重なる・接する部分を避ける
+            if 0 <= j < len(utts) and utts[j].get("speaker") != spk:
+                if j < k:
+                    lo = max(lo, utts[j]["end"] + EDGE_SEC)
+                else:
+                    hi = min(hi, utts[j]["start"] - EDGE_SEC)
+        # 単語が続いている区間（間 0.3秒未満）ごとに切る
+        runs, cur = [], None
+        for w in u["words"]:
+            ws, we = max(w["start"], lo), min(w["end"], hi)
+            if we <= ws:
+                continue
+            if cur and ws - cur[1] < 0.3:
+                cur[1] = we
+            else:
+                cur = [ws, we]
+                runs.append(cur)
+        for rs, run_end in runs:
+            t = rs
+            while run_end - t >= MIN_CLIP_SEC:
+                e = min(t + CLIP_SEC, run_end)
+                clips.setdefault(spk, []).append((t, e))
+                t = e
+    return clips
+
+
+def _best_vectors(vecs, limit: int):
+    """切れ端の声紋のうち、その人らしいもの（代表ベクトルに近い順）を limit 個選ぶ。
+    咳・笑い・他人の声が混ざった切れ端は代表から外れるので落ちる。"""
+    import numpy as np
+    if len(vecs) < 4:
+        return vecs
+    sims = vecs @ _mean_unit(vecs)
+    vecs = vecs[sims >= np.percentile(sims, 30)]
+    sims = vecs @ _mean_unit(vecs)  # 外れを除いた代表でもう一度選ぶ
+    return vecs[np.argsort(-sims)[:limit]]
+
+
+def learn_from_utterances(wav_path: str, utterances: list[dict], tag: str,
+                          only: set | None = None) -> dict:
+    """確定した話者名と音声から声紋を学習して保存する。その会議 (tag) から前に学習した分は
+    全員分いったん消してから入れ直す（話者を付け直した時に間違いが残らないように）。
+    only を渡すとその人だけ学習する（他の人の前回分は残す）。
+    Returns: {名前: 学習したベクトル数}"""
+    import numpy as np
+
+    data = _load_wav(wav_path)
+    clips = _clean_clips(utterances, len(data) / SAMPLE_RATE)
+    if only is not None:
+        clips = {n: c for n, c in clips.items() if n in only}
+    # 小さすぎる声（遠い席の人の相づち・隣の人の声の回り込み）は使わない
+    rms = {n: [float(np.sqrt(np.mean(data[int(s * SAMPLE_RATE):int(e * SAMPLE_RATE)] ** 2)))
+               for s, e in c] for n, c in clips.items()}
+    allr = [r for v in rms.values() for r in v]
+    ref = float(np.median(allr)) if allr else 0.0
+    picked = {}
+    for name, spans in clips.items():
+        spans = [sp for sp, r in zip(spans, rms[name]) if r >= ref * 0.5]
+        if len(spans) > 150:  # 会議全体からまんべんなく
+            spans = [spans[int(i * len(spans) / 150)] for i in range(150)]
+        if len(spans) >= 3:
+            picked[name] = spans
+    if only is None:
+        forget_job(tag)
+    learned = {}
+    for name, spans in picked.items():
+        chunks = [data[int(s * SAMPLE_RATE):int(e * SAMPLE_RATE)] for s, e in spans]
+        vecs = _best_vectors(_embed_chunks(chunks, batch_size=32), LEARN_PER_JOB)
+        save_voiceprint(name, vecs, tag=tag)
+        learned[name] = int(len(vecs))
+    logging.info(f"声紋を学習 ({tag}): {learned}")
+    return learned
 
 
 def enroll_from_audio(wav_path: str, name: str) -> tuple[int, float]:

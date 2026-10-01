@@ -48,6 +48,7 @@ DEFAULTS = {
         "max_speakers": 12,       # 自動推定するときの上限人数
         "hf_token": "",           # 設定するとpyannote（高精度）で話者分離
         "match_similarity": 0.55,    # 声紋DBの人物と判定する類似度
+        "auto_learn": True,       # 議事録を取るたびに、確定した話者の声紋を会議の音声から学習する
     },
     "subtitle": {
         "max_chars_line": 20,

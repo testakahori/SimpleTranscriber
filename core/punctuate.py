@@ -19,6 +19,7 @@ COMMA_GAP = 0.5      # この秒数以上の間で「、」（0.35秒だと言�
 PERIOD_GAP = 0.9     # この秒数以上の間で「。」（文末表現があれば SOFT_PERIOD_GAP で可）
 SOFT_PERIOD_GAP = 0.25
 CONJ_PERIOD_GAP = 1.5  # 「〜けど」「〜ので」の後はここまで黙った時だけ「。」
+LONG_PAUSE_GAP = 3.0   # 文が続く形でも、ここまで黙ったら言いさしで終わったとみなして「。」
 
 # 語の頭に来ない文字（この前で区切ると「ワ、ークスペース」「デ。ータ」のように語が割れる）
 _NO_WORD_HEAD = "ーぁぃぅぇぉゃゅょゎっァィゥェォャュョヮッヵヶんン"
@@ -118,7 +119,65 @@ def glue_word_heads(words: list[dict], labels: list | None = None) -> int:
     return glued
 
 
-def _mark_for(tail: str, gap: float, space_break: bool, nxt: str) -> str:
+# 文がまだ続く形（「その|施策」「後に、また|どう」「対象に|4月」）。考えながら話す人は
+# ここで1〜2秒黙るので、間だけで「。」にすると文が割れて別の行になってしまう
+_CONT_POS = ("連体詞", "接頭詞", "接続詞", "副詞", "フィラー")
+_CONT_FORMS = ("連用", "未然", "仮定", "体言接続", "ガル接続")
+
+
+def boundary_kind(tail: str, nxt: str) -> str:
+    """tail と次の単語 nxt の境目の文法上の性質（形態素解析）。
+    "inside"=語の途中（「どう|いう」）、"cont"=文が続く形、"" =文末になり得る/判定不能"""
+    tok = _janome()
+    t, n = tail.strip()[-16:], nxt.strip()[:6]
+    if tok is None or not t or not n:
+        return ""
+    if re.search(r"(ね|よ|か|わ)$", t) or SENTENCE_END_RE.search(t):
+        return ""
+    toks = list(tok.tokenize(t))  # 品詞は次の語を混ぜずに判定する（混ぜると誤解析しやすい）
+    last = toks[-1] if toks else None
+    if last is None or last.node_type == "UNKNOWN":
+        return ""
+    kind, sub = (last.part_of_speech.split(",") + [""])[:2]
+    # 語の途中: つなげて解析すると、tail の最後の語がそのまま次の語と1語になる場合だけ
+    # （「どう|いう」「先|ほど」）。助詞・助動詞の後（「けど|もし」「と|そこ」）や、
+    # tail の語が切り直される場合（「情報|いない」→「情|報い」）・未知語・数（「200|200」）は除く
+    if kind not in ("助詞", "助動詞", "記号"):
+        last_start, pos = len(t) - len(last.surface), 0
+        n_cuts = {len(t)}
+        for x in tok.tokenize(n):
+            n_cuts.add(max(n_cuts) + len(x.surface))
+        for x in tok.tokenize(t + n):
+            end = pos + len(x.surface)
+            if pos < len(t) < end:
+                # 次の語の側も語の切れ目で終わること（「はい|すいません」→「はいす」を除く）
+                if pos == last_start and end in n_cuts and x.node_type != "UNKNOWN" \
+                        and not x.part_of_speech.startswith("名詞,数"):
+                    return "inside"
+                break
+            pos = end
+    if kind in _CONT_POS:
+        return "cont"
+    if kind == "助詞":
+        return "" if "終助詞" in sub else "cont"
+    if kind in ("動詞", "形容詞", "助動詞") and last.infl_form.startswith(_CONT_FORMS):
+        return "cont"
+    return ""
+
+
+def _mark_for(tail: str, gap: float, space_break: bool, nxt: str, ahead: str = "") -> str:
+    """ahead: 次の単語から数語分（形態素解析用。nxt だけだと「どう|いう」が1語と分からない）"""
+    mark = _base_mark(tail, gap, space_break, nxt)
+    if mark in ("。", "、") and nxt:
+        kind = boundary_kind(tail, ahead or nxt)
+        if kind == "inside":
+            return ""
+        if kind == "cont" and mark == "。" and gap < LONG_PAUSE_GAP:
+            return "、" if nxt.strip() not in _PARTICLES else ""
+    return mark
+
+
+def _base_mark(tail: str, gap: float, space_break: bool, nxt: str) -> str:
     if QUESTION_RE.search(tail) and (gap >= SOFT_PERIOD_GAP or space_break):
         return "？"
     if CONJ_END_RE.search(tail):
@@ -156,7 +215,8 @@ def punctuate_segments(segments: list[dict]) -> int:
                 and _is_japanese(nxt["word"].strip()[:1]):
             space_break = True
             nxt["word"] = nxt["word"].lstrip(" 　")
-        mark = _mark_for(tail, gap, space_break, nxt["word"] if nxt else "")
+        ahead = "".join(segments[a]["words"][b]["word"] for a, b in words[k + 1:k + 4])
+        mark = _mark_for(tail, gap, space_break, nxt["word"] if nxt else "", ahead)
         if mark:
             w["word"] = token.rstrip() + mark
             added += 1
@@ -166,9 +226,10 @@ def punctuate_segments(segments: list[dict]) -> int:
     return added
 
 
-def repair_words(words: list[dict]) -> int:
+def repair_words(words: list[dict], labels: list | None = None) -> int:
     """以前の版で付けた、語の途中の句読点と「〜けど。」「〜ので。」の「。」を直す（その場で変更）。
-    保存済みの結果を作り直す時に使う。直した数を返す。"""
+    保存済みの結果を作り直す時に使う。labels（単語ごとの話者）があれば、話者が替わる所の
+    「。」は残す。直した数を返す。"""
     fixed = 0
     for i, w in enumerate(words):
         token = w.get("word", "")
@@ -176,13 +237,27 @@ def repair_words(words: list[dict]) -> int:
             continue
         nxt = words[i + 1] if i + 1 < len(words) else None
         body = token[:-1]
-        if nxt and body.strip() and inside_word(body, nxt.get("word", "")):
+        if not nxt or not body.strip():
+            continue
+        n = nxt.get("word", "").strip()
+        tail = "".join(x["word"] for x in words[max(0, i - 3):i]) + body
+        kind = boundary_kind(tail, "".join(x.get("word", "") for x in words[i + 1:i + 4]))
+        if inside_word(body, n):
+            b = body.strip()
+            # 数字の並び「200、200」「2、3」、漢字1文字の語末「広報、学生」はWhisper自身が
+            # 書いた区切りのことが多いので、形態素解析でも語の途中の時だけ消す
+            whisper_like = b[-1].isdigit() or (len(b) == 1 and _is_kanji(b)) or (
+                _is_katakana(b[-1]) and n[:1] not in _NO_WORD_HEAD)  # 「ポイント、アピール」
+            if token.endswith("、") and whisper_like and kind != "inside":
+                continue
             w["word"] = body
             fixed += 1
             continue
-        if token.endswith("。") and nxt and nxt["start"] - w["end"] < CONJ_PERIOD_GAP:
-            tail = "".join(x["word"] for x in words[max(0, i - 3):i]) + body
-            if CONJ_END_RE.search(tail.strip()):
-                w["word"] = body + "、"
-                fixed += 1
+        if kind == "inside":  # 「どう。いう」
+            w["word"] = body
+            fixed += 1
+        elif token.endswith("。") and nxt["start"] - w["end"] < LONG_PAUSE_GAP                 and not (labels and labels[i] != labels[i + 1]) and (kind == "cont" or (
+                nxt["start"] - w["end"] < CONJ_PERIOD_GAP and CONJ_END_RE.search(tail.strip()))):
+            w["word"] = body + ("" if nxt.get("word", "").strip() in _PARTICLES else "、")
+            fixed += 1
     return fixed
