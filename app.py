@@ -182,6 +182,33 @@ def _job_views(job: dict):
 # メイン処理パイプライン
 # =====================================================================
 
+def _voice_tag(job_dir) -> str:
+    return f"job:{Path(job_dir).name}"
+
+
+def learn_voices(job: dict) -> str:
+    """確定した話者名と会議の音声から声紋を学習する（同じ会議の前回分は置き換え）。
+    次の会議から、同じ声に自動で名前が付きやすくなる。結果の一言を返す。"""
+    if not diarization.available() or not job.get("audio_path") \
+            or not Path(job["audio_path"]).exists():
+        return ""
+    if not any(diarization.is_named(u.get("speaker", "")) for u in job.get("utterances", [])):
+        return ""
+    wav = None
+    try:
+        wav = audio.prepare_audio(job["audio_path"])
+        learned = diarization.learn_from_utterances(wav, job["utterances"], _voice_tag(job["job_dir"]))
+    except Exception as e:
+        logging.warning(f"声紋の学習に失敗: {e}")
+        return ""
+    finally:
+        if wav:
+            Path(wav).unlink(missing_ok=True)
+    if not learned:
+        return ""
+    return "🔊 この会議の声で声紋を学習しました（" + "、".join(learned) + "）。次回から自動で名前が付きます。"
+
+
 def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
     """フェーズ1: 音声変換 → 文字起こし → 話者分離 → 発話構築（GPU: Whisper / ECAPA）"""
     name = Path(path).name
@@ -219,17 +246,33 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
                 max_speakers=int(dia.get("max_speakers", 12)), hf_token=dia.get("hf_token", ""),
                 match_similarity=float(dia.get("match_similarity", 0.55)),
             )
+
+        threshold = settings.get("postprocess", {}).get("red_threshold", 0.5)
+        utts = U.build_utterances(result["segments"], word_speakers, threshold)
+        fillers = 0
+        if opts.get("fillers", True):
+            utts, fillers = U.remove_fillers(utts, threshold)
+        _finalize_text(utts, people_list)
+
+        # 声紋DBとはっきり一致した人は、この会議の声もすぐ学習する（あいまいな一致は、
+        # ②で確かめてから「③ 議事録を作る」の時に学習する）
+        # 「はっきり」の判定は、会議ごとの塊ではなく声紋全体の代表との類似度で行う
+        # （塊が多いほど偶然しきい値を超えやすく、間違いを自分で学習し続けるのを防ぐ）
+        dia = settings.get("diarization", {})
+        overall = diarization.load_voiceprints() if matched else {}
+        thr = float(dia.get("match_similarity", 0.55))
+        sure = {n for n in matched if n in overall and n in cluster_embeddings
+                and float(overall[n] @ cluster_embeddings[n]) >= thr}
+        if sure and dia.get("auto_learn", True):
+            sub(0.97, "声紋を学習中...")
+            try:
+                diarization.learn_from_utterances(wav, utts, _voice_tag(job_dir), only=sure)
+            except Exception as e:
+                logging.warning(f"声紋の学習に失敗: {e}")
     finally:
         Path(wav).unlink(missing_ok=True)
         if asr_wav != wav:
             Path(asr_wav).unlink(missing_ok=True)
-
-    threshold = settings.get("postprocess", {}).get("red_threshold", 0.5)
-    utts = U.build_utterances(result["segments"], word_speakers, threshold)
-    fillers = 0
-    if opts.get("fillers", True):
-        utts, fillers = U.remove_fillers(utts, threshold)
-    _finalize_text(utts, people_list)
 
     speed_label = dict((v, k) for k, v in transcriber.SPEED_CHOICES).get(result.get("speed"), "")
     meta_line = f"モデル: {result.get('model')}（{result.get('device')}・{speed_label.split('（')[0]}）"
@@ -494,6 +537,12 @@ def proofread_job(state, redo, progress=gr.Progress()):
 
 def _make_doc(state, kind: str, progress):
     none = tuple(gr.update() for _ in range(8))
+    learned = ""
+    if state and kind == "minutes" and config.load_settings()["diarization"].get("auto_learn", True):
+        # ②で直した後の話者で学習する（LLMにGPUを譲る前に済ませる）
+        progress(0.02, desc="直した話者で声紋を学習中...")
+        learned = learn_voices(state)
+        diarization.unload()
     err = _llm_ready(state)
     if err:
         return (err, gr.update()) + none
@@ -514,6 +563,8 @@ def _make_doc(state, kind: str, progress):
     notice = llm.pop_fallback_notice()
     if notice:
         msg += f"\n\n⚠️ {notice}"
+    if learned:
+        msg += f"\n\n{learned}"
     return (msg, job) + _job_views(job)
 
 
@@ -551,13 +602,15 @@ def assign_speakers(rows, save_voice, state):
     # 一括で置き換える（入れ替え A⇔B や連鎖 A→B→C でも話者が混ざらない）
     for u in job["utterances"]:
         u["speaker"] = mapping.get(u.get("speaker"), u.get("speaker"))
-    grouped, saved = {}, []
+    grouped = {}
     for label, vec in embeddings.items():
         grouped.setdefault(mapping.get(label, label), []).append(vec)
-    for name, vecs in grouped.items():
-        if save_voice and diarization.available() and name in mapping.values():
-            diarization.save_voiceprint(name, vecs)
-            saved.append(name)
+    if save_voice:
+        learned = learn_voices(job)
+    else:  # ①の直後に自動で学習した分が付け間違いだった場合に残さない
+        learned = ""
+        if diarization.available():
+            diarization.forget_job(_voice_tag(job["job_dir"]))
     embeddings = {n: (v[0] if len(v) == 1 else [sum(x) / len(v) for x in zip(*v)])
                   for n, v in grouped.items()}
     done = []
@@ -570,8 +623,8 @@ def assign_speakers(rows, save_voice, state):
     job["cluster_embeddings"] = embeddings
     _save_job(job)
     msg = f"✅ 話者を確定しました: {'、'.join(done)}"
-    if saved:
-        msg += f"\n\n🔊 声紋を保存しました（{'、'.join(saved)}）。次回から自動で名前が付きます。"
+    if learned:
+        msg += f"\n\n{learned}"
     msg += "\n\n議事録に反映するには「③ 📋 議事録を作る」を押してください。"
     return (msg, job) + _job_views(job)
 
