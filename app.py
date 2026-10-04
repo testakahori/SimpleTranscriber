@@ -223,6 +223,13 @@ def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fi
         dropped = job.get("stats", {}).get("hallucinations_dropped", 0)
         if dropped:
             lines.append(f"　🧹 無音・雑音区間の誤認識と思われる {dropped} 箇所を除外しました")
+        refilled = job.get("stats", {}).get("asr_refilled_sec", 0)
+        missing = job.get("stats", {}).get("asr_missing_sec", 0)
+        if refilled:
+            lines.append(f"　🩹 文字起こしが抜けていた所（計{refilled:.0f}秒）を自動でやり直して補いました")
+        if missing >= 10:
+            lines.append(f"　⚠️ 声があるのに文字にならなかった所が計{missing:.0f}秒あります"
+                         "（雑音・音楽・聞き取れない声の可能性。ログに時刻を出しています）")
         for err in job["errors"]:
             lines.append(f"　⚠️ {err}")
     lines.extend(failures)

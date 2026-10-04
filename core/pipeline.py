@@ -167,6 +167,8 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
             "whisper_model": result.get("model"),
             "device": result.get("device"),
             "hallucinations_dropped": result.get("dropped", 0),
+            "asr_refilled_sec": result.get("refilled_sec", 0.0),
+            "asr_missing_sec": result.get("missing_sec", 0.0),
             "fillers_removed": fillers,
             "elapsed_sec": round(result.get("elapsed", 0), 1),
         },
