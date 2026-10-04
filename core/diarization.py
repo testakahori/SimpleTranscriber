@@ -357,6 +357,12 @@ def _name_clusters(centroids: dict, order: list, match_similarity: float):
             # 比べる相手がいない（登録1人・話者1人）時は、しきい値未満では決めない
             if not rivals or sim - max(rivals) < MATCH_MARGIN:
                 continue
+            # あいまいな一致は「この話者に一番近い人物」かつ「その人物に一番近い話者」の時だけ。
+            # 名前が付いた後の人物・話者も比べる（実例: 未登録の人が、先に名前が付いた石川さんに
+            # 0.56 で一番近いのに、残りの岡田さん 0.53 が付いていた）
+            if any(v > sim for (c, n), v in score.items()
+                   if (c == cid and n != name) or (n == name and c != cid)):
+                continue
         cluster_names[cid] = name
         used.add(name)
         matched[name] = round(sim, 3)
