@@ -2,7 +2,6 @@ faster-whisper
 gradio
 PyYAML
 httpx
-anthropic
 python-docx
 reportlab
 soundfile

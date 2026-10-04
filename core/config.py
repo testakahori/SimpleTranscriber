@@ -1,6 +1,5 @@
 """設定の読み書き（settings.yaml）とパス定義"""
 import copy
-import os
 from pathlib import Path
 
 import yaml
@@ -15,7 +14,6 @@ PROMPTS_DIR = ROOT / "prompts"
 
 DEFAULTS = {
     "llm": {
-        "provider": "ollama",  # ollama | anthropic | openai | none
         "ollama_url": "http://localhost:11434",
         # gemma4 最上位（31B dense）の3bit量子化版。16GB VRAMに全部載るので4bit版の約10倍速い
         "ollama_model": "hf.co/unsloth/gemma-4-31B-it-GGUF:UD-IQ3_XXS",
@@ -23,10 +21,6 @@ DEFAULTS = {
         "ollama_think": False,         # 思考モード（議事録の質↑・時間↑）
         "ollama_max_ctx": 16384,       # これを超える長い会議は区間ごとに要約してから議事録化
         "ollama_fallback_model": "gemma4:12b-it-qat",  # メモリ不足で動かない時の代替
-        "anthropic_model": "claude-opus-4-8",
-        "anthropic_api_key": "",
-        "openai_model": "gpt-4o",
-        "openai_api_key": "",
     },
     "whisper": {
         "model": "auto",  # auto | large-v3 | large-v3-turbo | kotoba-whisper-v2.0 | medium | small
@@ -72,11 +66,17 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+_LEGACY_LLM_KEYS = ("provider", "anthropic_model", "anthropic_api_key",
+                    "openai_model", "openai_api_key")
+
+
 def load_settings() -> dict:
     if SETTINGS_PATH.exists():
         try:
             with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
+            for key in _LEGACY_LLM_KEYS:  # 旧版のクラウドAPI設定は読み捨てる（次の保存で消える）
+                (data.get("llm") or {}).pop(key, None)
             return _deep_merge(DEFAULTS, data)
         except Exception:
             pass
@@ -86,16 +86,6 @@ def load_settings() -> dict:
 def save_settings(settings: dict) -> None:
     with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
         yaml.safe_dump(settings, f, allow_unicode=True, sort_keys=False)
-
-
-def get_api_key(settings: dict, provider: str) -> str:
-    """設定 → 環境変数 の順でAPIキーを解決する"""
-    llm = settings.get("llm", {})
-    if provider == "anthropic":
-        return llm.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
-    if provider == "openai":
-        return llm.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
-    return ""
 
 
 def ensure_dirs() -> None:

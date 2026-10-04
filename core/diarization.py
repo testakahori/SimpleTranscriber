@@ -520,8 +520,6 @@ def _get_pyannote(hf_token: str):
 def _speaker_voiceprints(data, turns, max_sec: float = 90.0):
     """pyannoteの各話者について、長めの発話から最大90秒分の声紋(ECAPA)を作る。
     （声紋DB・声紋登録はECAPAで統一しているため、照合用にECAPAで計算し直す）"""
-    import numpy as np
-
     by_spk = {}
     for s, e, spk in turns:
         by_spk.setdefault(spk, []).append((s, e))
