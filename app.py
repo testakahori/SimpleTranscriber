@@ -1,5 +1,9 @@
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# 完全ローカルで使うツールなので、gradio / Hugging Face への利用状況の送信を止める
+# （起動のたびに外部へ通信していて、ネットワークが遅い時は起動も遅くなっていた）
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 # OSの証明書ストアを使う（セキュリティソフトのSSL検査環境でもモデルDLが通るように）
 try:
@@ -10,7 +14,7 @@ except Exception:
 
 import datetime
 import logging
-import re
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -18,10 +22,12 @@ from pathlib import Path
 import gradio as gr
 import httpx
 
-from core import audio, config, diarization, glossary, llm, minutes, output, people, punctuate, transcriber
+from core import audio, config, diarization, glossary, llm, minutes, output, people, transcriber
 from core import export as export_mod
 from core import search as search_mod
 from core import utterances as U
+from core import worker
+from core.pipeline import _finalize_text, _plain_md, _save_job, _voice_tag
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
@@ -49,13 +55,6 @@ def _cell(row, i, default=""):
     return str(v).strip()
 
 
-def _meeting_date_from_name(name: str) -> str:
-    m = re.search(r"(20\d{2})[-_.年]?(\d{1,2})[-_.月]?(\d{1,2})", name)
-    if m:
-        y, mo, d = (int(x) for x in m.groups())
-        if 1 <= mo <= 12 and 1 <= d <= 31:
-            return f"{y}年{mo}月{d}日"
-    return ""
 
 
 def _file_url(path: str | None) -> str:
@@ -67,29 +66,6 @@ def _file_url(path: str | None) -> str:
 # ジョブ（1ファイル分の結果）の保存・再描画
 # =====================================================================
 
-def _save_job(job: dict) -> None:
-    """発言データから transcript.md / srt / vtt / utterances.json を書き出す"""
-    job_dir = Path(job["job_dir"])
-    utts = job["utterances"]
-    settings = config.load_settings()
-    sub = settings.get("subtitle", {})
-
-    md = U.render_md(utts, job["source"], job.get("duration", 0.0), job.get("meta_line", ""))
-    output.write_text(job_dir, "transcript.md", md)
-    output.write_text(job_dir, "文字起こし.md", _plain_md(job))
-    cues = U.build_cues(utts, sub)
-    output.write_text(job_dir, "transcript.srt", U.cues_to_srt(cues, sub.get("speaker_prefix", False)))
-    output.write_text(job_dir, "transcript.vtt", U.cues_to_vtt(cues, sub.get("speaker_prefix", False)))
-    output.save_json(job_dir, "utterances.json", {
-        "source": job["source"],
-        "duration": job.get("duration", 0.0),
-        "meta_line": job.get("meta_line", ""),
-        "meeting_date": job.get("meeting_date", ""),
-        "memo": job.get("memo", ""),
-        "utterances": utts,
-    })
-    if job.get("cluster_embeddings"):
-        output.save_json(job_dir, "speaker_clusters.json", job["cluster_embeddings"])
 
 
 def _load_job(job_name: str) -> dict | None:
@@ -116,16 +92,8 @@ def _read_md(job: dict, name: str) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
-def _plain_md(job: dict) -> str:
-    return U.render_md(job["utterances"], job["source"], job.get("duration", 0.0),
-                       job.get("meta_line", ""), plain=True)
 
 
-def _finalize_text(utts: list[dict], people_list: list) -> None:
-    """人名の別名・用語の直し・「ー」→「一」を発話テキストに反映する"""
-    for u in utts:
-        u["marked"] = U.fix_ichi(glossary.apply_corrections(people.apply_aliases(u["marked"], people_list)))
-        u["text"] = U.strip_marks(u["marked"])
 
 
 def _download_transcript(job: dict):
@@ -182,123 +150,10 @@ def _job_views(job: dict):
 # メイン処理パイプライン
 # =====================================================================
 
-def _voice_tag(job_dir) -> str:
-    return f"job:{Path(job_dir).name}"
 
 
-def learn_voices(job: dict) -> str:
-    """確定した話者名と会議の音声から声紋を学習する（同じ会議の前回分は置き換え）。
-    次の会議から、同じ声に自動で名前が付きやすくなる。結果の一言を返す。"""
-    if not diarization.available() or not job.get("audio_path") \
-            or not Path(job["audio_path"]).exists():
-        return ""
-    if not any(diarization.is_named(u.get("speaker", "")) for u in job.get("utterances", [])):
-        return ""
-    wav = None
-    try:
-        wav = audio.prepare_audio(job["audio_path"])
-        learned = diarization.learn_from_utterances(wav, job["utterances"], _voice_tag(job["job_dir"]))
-    except Exception as e:
-        logging.warning(f"声紋の学習に失敗: {e}")
-        return ""
-    finally:
-        if wav:
-            Path(wav).unlink(missing_ok=True)
-    if not learned:
-        return ""
-    return "🔊 この会議の声で声紋を学習しました（" + "、".join(learned) + "）。次回から自動で名前が付きます。"
 
 
-def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
-    """フェーズ1: 音声変換 → 文字起こし → 話者分離 → 発話構築（GPU: Whisper / ECAPA）"""
-    name = Path(path).name
-    job_dir = output.create_job_dir(name)
-
-    sub(0.01, "音声を変換中...")
-    wav = audio.prepare_audio(path)
-    asr_wav = wav
-    try:
-        duration = audio.get_duration(wav)
-        preview = audio.make_preview_audio(path, str(job_dir / "audio.m4a"))
-        if opts["noise"]:
-            sub(0.03, "文字起こし用に音声を補正中（ノイズ除去）...")
-        asr_wav = audio.enhance_for_asr(wav, eq=opts.get("eq", True), noise_reduction=opts["noise"])
-
-        people_list = people.load_people()
-        terms = people.initial_prompt_terms(people_list)
-        sub(0.05, "文字起こし中...")
-        result = transcriber.transcribe(
-            asr_wav, model_name=opts["model"], language=opts["language"],
-            initial_prompt=glossary.build_initial_prompt(terms),
-            hotwords=glossary.build_hotwords(terms),
-            duration=duration, speed=opts.get("speed", "accurate"),
-            progress_cb=lambda f: sub(0.05 + 0.75 * f, f"文字起こし中... {int(f * 100)}%"),
-        )
-        punctuate.punctuate_segments(result["segments"])  # 「、」「。」を推定して補う
-
-        word_speakers, cluster_embeddings, matched = {}, {}, {}
-        if opts["diarize"] and diarization.available():
-            sub(0.82, "話者を識別中（声紋照合）...")
-            dia = settings.get("diarization", {})
-            word_speakers, cluster_embeddings, matched = diarization.diarize(
-                wav, result["segments"],
-                num_speakers=int(opts["num_speakers"] or 0),
-                max_speakers=int(dia.get("max_speakers", 12)), hf_token=dia.get("hf_token", ""),
-                match_similarity=float(dia.get("match_similarity", 0.55)),
-            )
-
-        threshold = settings.get("postprocess", {}).get("red_threshold", 0.5)
-        utts = U.build_utterances(result["segments"], word_speakers, threshold)
-        fillers = 0
-        if opts.get("fillers", True):
-            utts, fillers = U.remove_fillers(utts, threshold)
-        _finalize_text(utts, people_list)
-
-        # 声紋DBとはっきり一致した人は、この会議の声もすぐ学習する（あいまいな一致は、
-        # ②で確かめてから「③ 議事録を作る」の時に学習する）
-        # 「はっきり」の判定は、会議ごとの塊ではなく声紋全体の代表との類似度で行う
-        # （塊が多いほど偶然しきい値を超えやすく、間違いを自分で学習し続けるのを防ぐ）
-        dia = settings.get("diarization", {})
-        overall = diarization.load_voiceprints() if matched else {}
-        thr = float(dia.get("match_similarity", 0.55))
-        sure = {n for n in matched if n in overall and n in cluster_embeddings
-                and float(overall[n] @ cluster_embeddings[n]) >= thr}
-        if sure and dia.get("auto_learn", True):
-            sub(0.97, "声紋を学習中...")
-            try:
-                diarization.learn_from_utterances(wav, utts, _voice_tag(job_dir), only=sure)
-            except Exception as e:
-                logging.warning(f"声紋の学習に失敗: {e}")
-    finally:
-        Path(wav).unlink(missing_ok=True)
-        if asr_wav != wav:
-            Path(asr_wav).unlink(missing_ok=True)
-
-    speed_label = dict((v, k) for k, v in transcriber.SPEED_CHOICES).get(result.get("speed"), "")
-    meta_line = f"モデル: {result.get('model')}（{result.get('device')}・{speed_label.split('（')[0]}）"
-    job = {
-        "job_dir": str(job_dir),
-        "source": name,
-        "duration": duration,
-        "meta_line": meta_line,
-        "meeting_date": opts.get("meeting_date") or _meeting_date_from_name(name),
-        "memo": opts.get("memo", ""),
-        "utterances": utts,
-        "cluster_embeddings": {k: v.tolist() for k, v in cluster_embeddings.items()},
-        "audio_path": preview,
-        "errors": [],
-        "matched": matched,
-        "stats": {
-            "whisper_model": result.get("model"),
-            "device": result.get("device"),
-            "hallucinations_dropped": result.get("dropped", 0),
-            "fillers_removed": fillers,
-            "elapsed_sec": round(result.get("elapsed", 0), 1),
-        },
-    }
-    _save_job(job)
-    sub(1.0, "文字起こし完了")
-    return job
 
 
 def _write_meta(job: dict, opts: dict, settings: dict) -> None:
@@ -332,23 +187,24 @@ def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fi
     }
     paths = [f if isinstance(f, str) else f.name for f in files]
     n = len(paths)
-    t_share = 1.0
 
     # 前回のLLM(gemma4:31b)がメモリに残っているとWhisperが読み込めないため先に解放
     llm.unload_ollama(settings)
 
+    # Whisper・話者分離は別プロセスで動かす（終わるとVRAMが全部空き、③のLLMが遅くならない）
     jobs, failures = [], []
-    for i, path in enumerate(paths):
-        name = Path(path).name
-
-        def sub(frac, desc, i=i, name=name):
-            progress(t_share * (i + frac) / n, desc=f"[{i + 1}/{n}] {name}: {desc}")
-
-        try:
-            jobs.append(_transcribe_one(path, opts, settings, sub))
-        except Exception as e:
-            logging.error(traceback.format_exc())
-            failures.append(f"❌ {name}: {e}")
+    progress(0.0, desc="文字起こしの準備中（モデルを読み込んでいます）...")
+    try:
+        results = worker.run("core.pipeline:transcribe_files", paths, opts, settings,
+                             progress=lambda f, d: progress(f, desc=d))
+    except Exception as e:
+        logging.error(traceback.format_exc())
+        results = [{"error": str(e)}]
+    for r in results:
+        if "job" in r:
+            jobs.append(r["job"])
+        else:
+            failures.append(f"❌ {r['error']}")
 
     for job in jobs:
         _write_meta(job, opts, settings)
@@ -406,20 +262,16 @@ def rediarize_job(state, num_speakers, progress=gr.Progress()):
     job = state
     settings = config.load_settings()
     llm.unload_ollama(settings)  # GPUを空ける
-    progress(0.05, desc="音声を準備中...")
+    progress(0.02, desc="準備中...")
     segments = [{"start": u["start"], "end": u["end"], "text": u["text"],
                  "words": u.get("words") or []} for u in job["utterances"]]
-    wav = audio.prepare_audio(job["audio_path"])
     try:
-        progress(0.2, desc="話者を識別中（声紋照合）...")
-        dia = settings.get("diarization", {})
-        word_speakers, cluster_embeddings, matched = diarization.diarize(
-            wav, segments, num_speakers=int(num_speakers or 0),
-            max_speakers=int(dia.get("max_speakers", 12)), hf_token=dia.get("hf_token", ""),
-            match_similarity=float(dia.get("match_similarity", 0.55)),
-        )
-    finally:
-        Path(wav).unlink(missing_ok=True)
+        word_speakers, cluster_embeddings, matched = worker.run(
+            "core.pipeline:rediarize", job["audio_path"], segments, int(num_speakers or 0), settings,
+            progress=lambda f, d: progress(f, desc=d))
+    except Exception as e:
+        logging.error(traceback.format_exc())
+        return (f"❌ 話者識別に失敗しました: {e}", gr.update()) + none
     if not word_speakers:
         return ("❌ 話者識別に失敗しました（ログを確認してください）", gr.update()) + none
     threshold = settings.get("postprocess", {}).get("red_threshold", 0.5)
@@ -427,7 +279,7 @@ def rediarize_job(state, num_speakers, progress=gr.Progress()):
     utts = U.build_utterances(segments, word_speakers, threshold)
     _finalize_text(utts, people_list)
     job["utterances"] = utts
-    job["cluster_embeddings"] = {k: v.tolist() for k, v in cluster_embeddings.items()}
+    job["cluster_embeddings"] = cluster_embeddings
     _save_job(job)
     stats = U.speaker_stats(utts)
     msg = (f"✅ 話者識別をやり直しました: {len(stats)}名 ／ 発言 {len(utts)} 件"
@@ -472,12 +324,22 @@ def refresh_history():
     return gr.update(choices=output.list_editable_jobs())
 
 
+def _learn_voices(job: dict) -> str:
+    """声紋の学習（core.pipeline.learn_voices）を別プロセスで行う。失敗しても議事録作成は続ける"""
+    if not diarization.available():
+        return ""
+    slim = {k: job.get(k) for k in ("job_dir", "audio_path", "utterances")}
+    try:
+        return worker.run("core.pipeline:learn_voices", slim)
+    except Exception as e:
+        logging.warning(f"声紋の学習に失敗: {e}")
+        return ""
+
+
 def _llm_ready(state):
     """②③の共通チェック。問題があればメッセージを返す"""
     if not state:
         return "⚠️ 先に文字起こしを実行するか、過去の結果を開いてください。"
-    if config.load_settings()["llm"]["provider"] == "none":
-        return "⚠️ 設定タブでLLMを選択してください。"
     # Whisper・声紋モデルをVRAMから降ろして、LLM(gemma4)にGPUを譲る
     transcriber.unload()
     diarization.unload()
@@ -541,8 +403,7 @@ def _make_doc(state, kind: str, progress):
     if state and kind == "minutes" and config.load_settings()["diarization"].get("auto_learn", True):
         # ②で直した後の話者で学習する（LLMにGPUを譲る前に済ませる）
         progress(0.02, desc="直した話者で声紋を学習中...")
-        learned = learn_voices(state)
-        diarization.unload()
+        learned = _learn_voices(state)
     err = _llm_ready(state)
     if err:
         return (err, gr.update()) + none
@@ -606,7 +467,7 @@ def assign_speakers(rows, save_voice, state):
     for label, vec in embeddings.items():
         grouped.setdefault(mapping.get(label, label), []).append(vec)
     if save_voice:
-        learned = learn_voices(job)
+        learned = _learn_voices(job)
     else:  # ①の直後に自動で学習した分が付け間違いだった場合に残さない
         learned = ""
         if diarization.available():
@@ -828,11 +689,7 @@ def enroll_voice(name, audio_path, file_obj):
     if not diarization.available():
         return "❌ 話者分離ライブラリが未導入です。", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
     try:
-        wav = audio.prepare_audio(src)
-        try:
-            added, sec = diarization.enroll_from_audio(wav, name)
-        finally:
-            Path(wav).unlink(missing_ok=True)
+        added, sec = worker.run("core.pipeline:enroll", src, name)
     except Exception as e:
         logging.error(traceback.format_exc())
         return f"❌ 登録に失敗しました: {e}", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
@@ -866,11 +723,7 @@ def test_voice(audio_path, file_obj):
     if not diarization.list_voiceprints():
         return "⚠️ 声紋がまだ登録されていません。"
     try:
-        wav = audio.prepare_audio(src)
-        try:
-            scores = diarization.identify(wav)
-        finally:
-            Path(wav).unlink(missing_ok=True)
+        scores = worker.run("core.pipeline:identify", src)
     except Exception as e:
         return f"❌ 判定に失敗しました: {e}"
     thr = config.load_settings()["diarization"].get("match_similarity", 0.55)
@@ -969,19 +822,13 @@ def ollama_models(url: str) -> list[str]:
         return []
 
 
-def save_settings_ui(provider, ollama_url, ollama_model, ollama_think, anthropic_key,
-                     anthropic_model, openai_key, openai_model, whisper_model, language,
+def save_settings_ui(ollama_url, ollama_model, ollama_think, whisper_model, language,
                      red_threshold, cluster_sim, match_sim, hf_token):
     settings = config.load_settings()
     settings["llm"].update({
-        "provider": provider,
         "ollama_url": ollama_url.strip(),
         "ollama_model": (ollama_model or "").strip(),
         "ollama_think": bool(ollama_think),
-        "anthropic_api_key": anthropic_key.strip(),
-        "anthropic_model": anthropic_model.strip(),
-        "openai_api_key": openai_key.strip(),
-        "openai_model": openai_model.strip(),
     })
     settings["whisper"].update({"model": whisper_model, "language": language})
     settings["postprocess"]["red_threshold"] = float(red_threshold)
@@ -989,10 +836,7 @@ def save_settings_ui(provider, ollama_url, ollama_model, ollama_think, anthropic
     settings["diarization"].update({"max_speakers": int(cluster_sim),
                                     "match_similarity": float(match_sim)})
     config.save_settings(settings)
-    warn = ""
-    if provider in ("anthropic", "openai"):
-        warn = "\n⚠️ クラウドモードでは文字起こしテキストが外部APIに送信されます（音声自体は送信されません）。"
-    return f"✅ 設定を保存しました。{warn}"
+    return "✅ 設定を保存しました。"
 
 
 def test_llm():
@@ -1010,21 +854,45 @@ CSS = """
 """
 
 
+# GPUの有無の確認は ctranslate2 / torch の読み込みで数秒かかるので、起動を待たせないよう
+# 裏で調べて、画面が開いてから状態の行に反映する
+_devices: dict = {}
+
+
+def _probe_devices() -> None:
+    try:
+        _devices["asr"] = transcriber.detect_device()[0]
+        _devices["dia"] = diarization.device_label() if diarization.available() else "-"
+    except Exception as e:
+        logging.warning(f"GPUの確認に失敗: {e}")
+
+
+_probe_thread = threading.Thread(target=_probe_devices, daemon=True)
+
+
+def status_line() -> str:
+    settings = config.load_settings()
+    _probe_thread.join(timeout=30)
+    asr = "🟢 GPU" if _devices.get("asr") == "cuda" else "🟡 CPU"
+    if diarization.available():
+        dia = ("✅ " + diarization.backend_label(settings["diarization"].get("hf_token", ""))
+               + "・" + _devices.get("dia", "cpu").upper())
+    else:
+        dia = "➖ 未導入"
+    return (f"文字起こし: {asr} ／ 話者識別: {dia} ／ "
+            f"LLM: {llm.provider_label(settings)} ／ 登録声紋: {len(diarization.list_voiceprints())}名")
+
+
 def build_ui():
     settings = config.load_settings()
-    device, _ = transcriber.detect_device()
-    dia_available = diarization.available()
-    dia_dev = diarization.device_label() if dia_available else "-"
-    device_label = "🟢 GPU" if device == "cuda" else "🟡 CPU"
     sub = settings.get("subtitle", {})
+    dia_available = diarization.available()  # 軽い（パッケージの有無だけ見る）
+    if not _probe_thread.is_alive() and not _devices:
+        _probe_thread.start()
 
     with gr.Blocks(title="つよつよ文字起こし＆議事録ツール") as demo:
         gr.Markdown("# 🎙️ つよつよ文字起こし＆議事録ツール")
-        gr.Markdown(
-            f"文字起こし: {device_label} ／ 話者識別: "
-            f"{'✅ ' + diarization.backend_label(settings['diarization'].get('hf_token', '')) + '・' + dia_dev.upper() if dia_available else '➖ 未導入'} ／ "
-            f"LLM: {llm.provider_label(settings)} ／ 登録声紋: {len(diarization.list_voiceprints())}名"
-        )
+        status_md = gr.Markdown("文字起こし: 確認中… ／ 話者識別: 確認中…")
 
         job_state = gr.State(None)
 
@@ -1262,12 +1130,7 @@ def build_ui():
             # ======================== 設定 ========================
             with gr.Tab("⚙️ 設定"):
                 gr.Markdown("## LLM（校正・議事録・要約の頭脳）")
-                provider_radio = gr.Radio(
-                    choices=[("Ollama（ローカル・無料・完全オフライン）", "ollama"),
-                             ("Claude API", "anthropic"), ("OpenAI API", "openai"),
-                             ("使わない（文字起こしのみ）", "none")],
-                    value=settings["llm"]["provider"], label="プロバイダ",
-                )
+                gr.Markdown("Ollama 上の gemma4 だけで動きます（完全ローカル・文字起こしは外部に送りません）。")
                 with gr.Group():
                     ollama_url_box = gr.Textbox(value=settings["llm"]["ollama_url"], label="Ollama URL")
                     ollama_list = ollama_models(settings["llm"]["ollama_url"])
@@ -1280,18 +1143,6 @@ def build_ui():
                     ollama_think_cb = gr.Checkbox(
                         value=settings["llm"].get("ollama_think", False),
                         label="思考モード（議事録の質が上がるが時間は数倍）")
-                with gr.Group():
-                    anthropic_key_box = gr.Textbox(
-                        value=settings["llm"]["anthropic_api_key"], label="Claude APIキー",
-                        type="password", info="空欄なら環境変数 ANTHROPIC_API_KEY を使用")
-                    anthropic_model_box = gr.Textbox(value=settings["llm"]["anthropic_model"],
-                                                     label="Claudeモデル")
-                with gr.Group():
-                    openai_key_box = gr.Textbox(
-                        value=settings["llm"]["openai_api_key"], label="OpenAI APIキー",
-                        type="password", info="空欄なら環境変数 OPENAI_API_KEY を使用")
-                    openai_model_box = gr.Textbox(value=settings["llm"]["openai_model"],
-                                                  label="OpenAIモデル")
 
                 gr.Markdown("## 文字起こし")
                 whisper_model_dd = gr.Dropdown(transcriber.MODEL_CHOICES,
@@ -1388,14 +1239,13 @@ def build_ui():
                                    outputs=corrections_status)
         settings_save_btn.click(
             fn=save_settings_ui,
-            inputs=[provider_radio, ollama_url_box, ollama_model_box, ollama_think_cb,
-                    anthropic_key_box, anthropic_model_box, openai_key_box, openai_model_box,
-                    whisper_model_dd, lang_default_dd, red_threshold_slider,
+            inputs=[ollama_url_box, ollama_model_box, ollama_think_cb, whisper_model_dd, lang_default_dd, red_threshold_slider,
                     cluster_sim_slider, match_sim_slider, hf_token_box],
             outputs=settings_status,
         )
         test_btn.click(fn=test_llm, outputs=settings_status)
 
+        demo.load(fn=status_line, outputs=status_md)
         demo.load(fn=refresh_jobs, outputs=[job_dd, md_dd])
         demo.load(fn=refresh_history, outputs=history_dd)
 

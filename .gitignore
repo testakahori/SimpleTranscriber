@@ -11,13 +11,16 @@ error.log
 *.log
 
 # 実行時に生成されるユーザーデータ（会議内容・声紋・学習データ・APIキー）
-output/
+output/*
+!output/.gitkeep
 profiles/
 corrections/
 settings.yaml
 
-# Original meeting audio (never commit)
-motonoonsei/
+# Original meeting audio (never commit; only the empty folder is kept)
+motonoonsei/*
+!motonoonsei/.gitkeep
 
-# Voice samples for voiceprint enrollment (real people, never commit)
-seimon/
+# Voice samples for voiceprint enrollment (real people, never commit; only the empty folder is kept)
+seimon/*
+!seimon/.gitkeep
