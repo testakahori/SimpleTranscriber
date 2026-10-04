@@ -1,4 +1,5 @@
 """人物マスタ（呼び名→正式表記、声紋ファイル、役職）"""
+import re
 from pathlib import Path
 
 import yaml
@@ -52,7 +53,9 @@ def apply_aliases(text: str, people: list[dict] | None = None) -> str:
 
 
 def initial_prompt_terms(people: list[dict] | None = None) -> list[str]:
-    """Whisperの initial_prompt に入れる人名リスト（正式表記＋呼び名）"""
+    """Whisperの initial_prompt に入れる人名リスト（正式表記＋呼び名）。
+    「質問者1」「話者A」のような仮の名前は入れない（聞き取りにくい所でWhisperが
+    「質問者4。質問者5 質問者6…」と続きを捏造していた）"""
     if people is None:
         people = load_people()
     terms = []
@@ -60,7 +63,11 @@ def initial_prompt_terms(people: list[dict] | None = None) -> list[str]:
         if p.get("display_name"):
             terms.append(p["display_name"])
         terms.extend(str(a).strip() for a in (p.get("aliases") or []) if str(a).strip())
-    return terms
+    return [t for t in terms if not _PLACEHOLDER_RE.match(t)]
+
+
+_PLACEHOLDER_RE = re.compile(r"^(質問者|話者|参加者|発表者|司会|スピーカー|speaker|不明|unknown)\s*([0-9０-９]+|[A-ZＡ-Ｚ])?$",
+                             re.IGNORECASE)
 
 
 def people_summary_md(people: list[dict] | None = None) -> str:
