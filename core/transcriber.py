@@ -109,6 +109,124 @@ def _is_hallucination(seg) -> bool:
     return False
 
 
+GAP_RETRY_SEC = 20.0  # 発話検出(VAD)が使えない時: 文字が1つも無い区間がこれ以上続いたらやり直す
+MISS_MIN_SEC = 3.0    # 声があるのに文字が無い所がこれ以上あれば、その部分だけやり直す
+COVER_PAD_SEC = 1.0   # 単語の前後これだけは文字があるとみなす（単語の時刻のずれ）
+
+
+def _segment_dict(seg, offset: float = 0.0) -> dict:
+    words = [_unstretch({"start": float(w.start) + offset, "end": float(w.end) + offset,
+                         "word": w.word, "prob": float(w.probability)})
+             for w in (seg.words or [])]
+    return {"start": float(seg.start) + offset, "end": float(seg.end) + offset,
+            "text": seg.text.strip(), "words": words}
+
+
+def _merge_spans(spans: list, join_sec: float = 0.0) -> list:
+    out = []
+    for s, e in sorted(spans):
+        if out and s - out[-1][1] <= join_sec:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
+def _missed_spans(wav_path: str, segments: list[dict], total: float) -> list[tuple[float, float]]:
+    """声がある（VAD）のに文字が1つも付いていない部分 → [(開始, 終了)]。
+    VADが使えない時は、文字が GAP_RETRY_SEC 以上続けて無い区間を返す。"""
+    covered = []
+    for s in segments:
+        spans = [(w["start"], w["end"]) for w in s.get("words") or []] or [(s["start"], s["end"])]
+        covered += [(a - COVER_PAD_SEC, b + COVER_PAD_SEC) for a, b in spans]
+    covered = _merge_spans(covered)
+    try:
+        import soundfile as sf
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+        audio_, rate = sf.read(wav_path, dtype="float32")
+        if audio_.ndim > 1:
+            audio_ = audio_.mean(axis=1)
+        speech = [(t["start"] / rate, t["end"] / rate) for t in get_speech_timestamps(
+            audio_, VadOptions(min_silence_duration_ms=500, speech_pad_ms=300), sampling_rate=rate)]
+        del audio_
+    except Exception as e:
+        logging.warning(f"発話検出に失敗したため、文字の無い長い区間だけを確認します: {e}")
+        edges = [-COVER_PAD_SEC] + [x for c in covered for x in c] + [total + COVER_PAD_SEC]
+        return [(a, b) for a, b in zip(edges[::2], edges[1::2]) if b - a >= GAP_RETRY_SEC]
+
+    # 声の区間から、文字がある所を引く
+    missed = []
+    for s, e in speech:
+        t = s
+        for cs, ce in covered:
+            if ce <= t or cs >= e:
+                continue
+            if cs > t:
+                missed.append((t, cs))
+            t = max(t, ce)
+        if t < e:
+            missed.append((t, e))
+    # 近い切れ端はまとめて1回でやり直す。声の合計が短い所（咳・相づち）は対象外
+    out = []
+    for a, b in _merge_spans(missed, join_sec=2.0):
+        voiced = sum(min(b, me) - max(a, ms) for ms, me in missed if me > a and ms < b)
+        if voiced >= MISS_MIN_SEC:
+            out.append((max(0.0, a), min(total, b) if total else b))
+    return out
+
+
+def _fill_gaps(model, wav_path: str, segments: list[dict], total: float, kwargs: dict) -> dict:
+    """声があるのに文字が無い部分を、前の文脈を使わずにもう一度文字起こしして segments に足す。
+
+    Whisperは「無音らしく自信も低い」30秒窓を黙って飛ばす。前の発言を文脈にしていると、
+    文脈が崩れた所から窓を飛ばし続け、実会議（2時間）で38分ぶん丸ごと抜けていた
+    （その区間だけを文字起こしすると普通に取れる）。短い抜けも同じ仕組みで起きる。
+    Returns: {"dropped": 除外したハルシネーション数, "refilled_sec": 補った区間の長さ,
+              "missing_sec": やり直しても文字にならなかった声の長さ}"""
+    import soundfile as sf
+
+    stats = {"dropped": 0, "refilled_sec": 0.0, "missing_sec": 0.0}
+    spans = _missed_spans(wav_path, segments, total)
+    if not spans:
+        return stats
+    rate = sf.info(wav_path).samplerate
+    kwargs = dict(kwargs, condition_on_previous_text=False)
+    added = []
+    for a, b in spans:
+        lo = max(0.0, a - 0.5)  # 語頭が切れないよう少し広めに聞かせ、足すのは抜けの中の単語だけ
+        audio_, _ = sf.read(wav_path, start=int(lo * rate), stop=int((b + 0.5) * rate), dtype="float32")
+        if audio_.ndim > 1:
+            audio_ = audio_.mean(axis=1)
+        segs, _ = model.transcribe(audio_, **kwargs)
+        n = 0
+        for seg in segs:
+            if _is_hallucination(seg):
+                stats["dropped"] += 1
+                continue
+            d = _segment_dict(seg, lo)
+            d["words"] = [w for w in d["words"] if a <= (w["start"] + w["end"]) / 2 <= b]
+            if not d["words"]:
+                continue
+            d["start"], d["end"] = d["words"][0]["start"], d["words"][-1]["end"]
+            d["text"] = "".join(w["word"] for w in d["words"]).strip()
+            added.append(d)
+            n += 1
+        if n:
+            stats["refilled_sec"] += b - a
+            logging.warning(f"文字起こしの抜けを補いました: {a:.0f}s〜{b:.0f}s（{n}区間）")
+    segments.extend(added)
+    segments.sort(key=lambda s: s["start"])
+    remain = _missed_spans(wav_path, segments, total)
+    stats["missing_sec"] = sum(b - a for a, b in remain)
+    if remain:
+        logging.warning("やり直しても文字にならなかった声: " +
+                        "、".join(f"{a:.0f}s〜{b:.0f}s" for a, b in remain[:20]))
+    stats["refilled_sec"] = round(stats["refilled_sec"], 1)
+    stats["missing_sec"] = round(stats["missing_sec"], 1)
+    return stats
+
+
 def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
                initial_prompt: str = "", hotwords: str = "", duration: float = 0.0,
                progress_cb=None, speed: str = "accurate") -> dict:
@@ -175,17 +293,12 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
             dropped += 1
             logging.info(f"ハルシネーション疑いを除外: [{seg.start:.1f}s] {seg.text.strip()[:40]}")
             continue
-        words = []
-        for w in (seg.words or []):
-            words.append(_unstretch({
-                "start": float(w.start), "end": float(w.end),
-                "word": w.word, "prob": float(w.probability),
-            }))
-        segments.append({
-            "start": float(seg.start), "end": float(seg.end),
-            "text": seg.text.strip(), "words": words,
-        })
+        segments.append(_segment_dict(seg))
         logging.info(f"進捗: [{seg.start:.1f}s -> {seg.end:.1f}s]")
+
+    retry_kwargs = {k: v for k, v in kwargs.items() if k not in ("batch_size", "chunk_length")}
+    fill = _fill_gaps(model, wav_path, segments, total, retry_kwargs)
+    dropped += fill["dropped"]
 
     elapsed = time.time() - start_time
     logging.info(f"文字起こし完了 ({elapsed:.1f}秒, model={name}, device={device}, 除外={dropped})")
@@ -197,5 +310,7 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
         "speed": speed,
         "device": device,
         "dropped": dropped,
+        "refilled_sec": fill["refilled_sec"],
+        "missing_sec": fill["missing_sec"],
         "segments": segments,
     }
