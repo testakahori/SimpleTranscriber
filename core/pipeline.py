@@ -107,7 +107,7 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
             initial_prompt=glossary.build_initial_prompt(terms),
             hotwords=glossary.build_hotwords(terms),
             duration=duration, speed=opts.get("speed", "accurate"),
-            progress_cb=lambda f: sub(0.05 + 0.75 * f, f"文字起こし中... {int(f * 100)}%"),
+            progress_cb=lambda f, desc=None: sub(0.05 + 0.75 * f, desc or f"文字起こし中... {int(f * 100)}%"),
         )
         punctuate.punctuate_segments(result["segments"])  # 「、」「。」を推定して補う
 
