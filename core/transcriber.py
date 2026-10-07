@@ -112,6 +112,13 @@ def _is_hallucination(seg) -> bool:
 GAP_RETRY_SEC = 20.0  # 発話検出(VAD)が使えない時: 文字が1つも無い区間がこれ以上続いたらやり直す
 MISS_MIN_SEC = 3.0    # 声があるのに文字が無い所がこれ以上あれば、その部分だけやり直す
 COVER_PAD_SEC = 1.0   # 単語の前後これだけは文字があるとみなす（単語の時刻のずれ）
+# やり直しは数秒の切れ端が数百か所になることがある。1か所ずつは軽く済ませる:
+#   温度を変えた再試行は2段まで（既定の6段×ビーム5だと、繰り返しループした所で1か所数十秒かかった）
+#   1窓で出す文字数の上限を切れ端の長さに合わせる（「岡田 岡田 岡田…」と延々続けさせない）
+GAP_TEMPERATURES = (0.0, 0.4)
+GAP_TOKENS_PER_SEC = 14  # 30秒窓で430（Whisperの上限448未満）
+MAIN_PASS_SHARE = 0.9  # 進捗バーのうち1回目の文字起こしの割合（残りは抜けのやり直し）
+_REPEAT_RE = re.compile(r"(\S{1,8}?)(?:\s*\1){3,}")  # 同じ語が4回以上続く（短い切れ端で起きる捏造）
 
 
 def _segment_dict(seg, offset: float = 0.0) -> dict:
@@ -176,7 +183,8 @@ def _missed_spans(wav_path: str, segments: list[dict], total: float) -> list[tup
     return out
 
 
-def _fill_gaps(model, wav_path: str, segments: list[dict], total: float, kwargs: dict) -> dict:
+def _fill_gaps(model, wav_path: str, segments: list[dict], total: float, kwargs: dict,
+               progress_cb=None) -> dict:
     """声があるのに文字が無い部分を、前の文脈を使わずにもう一度文字起こしして segments に足す。
 
     Whisperは「無音らしく自信も低い」30秒窓を黙って飛ばす。前の発言を文脈にしていると、
@@ -191,19 +199,32 @@ def _fill_gaps(model, wav_path: str, segments: list[dict], total: float, kwargs:
     if not spans:
         return stats
     rate = sf.info(wav_path).samplerate
-    kwargs = dict(kwargs, condition_on_previous_text=False)
+    # 人名などのヒントは短い切れ端だと「その名前を繰り返す」捏造を招くので渡さない
+    kwargs = {k: v for k, v in kwargs.items() if k not in ("initial_prompt", "hotwords")}
+    kwargs.update(condition_on_previous_text=False, temperature=list(GAP_TEMPERATURES))
     added = []
-    for a, b in spans:
+    for i, (a, b) in enumerate(spans):
+        if progress_cb:
+            try:
+                progress_cb(i / len(spans), f"聞き取れなかった所をやり直し中... {i + 1}/{len(spans)}か所")
+            except Exception:
+                pass
         lo = max(0.0, a - 0.5)  # 語頭が切れないよう少し広めに聞かせ、足すのは抜けの中の単語だけ
         audio_, _ = sf.read(wav_path, start=int(lo * rate), stop=int((b + 0.5) * rate), dtype="float32")
         if audio_.ndim > 1:
             audio_ = audio_.mean(axis=1)
-        segs, _ = model.transcribe(audio_, **kwargs)
-        n = 0
+        window = min(b + 0.5 - lo, 30.0)
+        segs, _ = model.transcribe(audio_, max_new_tokens=int(window * GAP_TOKENS_PER_SEC) + 10, **kwargs)
+        n, bad_run, prev = 0, 0, None
         for seg in segs:
-            if _is_hallucination(seg):
+            text = seg.text.strip()
+            if _is_hallucination(seg) or _REPEAT_RE.search(text) or text == prev:
                 stats["dropped"] += 1
+                bad_run += 1
+                if bad_run >= 2:  # 捏造のループに入った。この切れ端は諦めて次へ（続けても同じ文が出るだけ）
+                    break
                 continue
+            bad_run, prev = 0, text
             d = _segment_dict(seg, lo)
             d["words"] = [w for w in d["words"] if a <= (w["start"] + w["end"]) / 2 <= b]
             if not d["words"]:
@@ -286,7 +307,7 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
     for seg in segments_iter:
         if progress_cb and total > 0:
             try:
-                progress_cb(min(seg.end / total, 1.0))
+                progress_cb(MAIN_PASS_SHARE * min(seg.end / total, 1.0))
             except Exception:
                 pass
         if _is_hallucination(seg):
@@ -297,7 +318,11 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
         logging.info(f"進捗: [{seg.start:.1f}s -> {seg.end:.1f}s]")
 
     retry_kwargs = {k: v for k, v in kwargs.items() if k not in ("batch_size", "chunk_length")}
-    fill = _fill_gaps(model, wav_path, segments, total, retry_kwargs)
+    fill_cb = None
+    if progress_cb:
+        def fill_cb(f, desc):
+            progress_cb(MAIN_PASS_SHARE + (1 - MAIN_PASS_SHARE) * f, desc)
+    fill = _fill_gaps(model, wav_path, segments, total, retry_kwargs, progress_cb=fill_cb)
     dropped += fill["dropped"]
 
     elapsed = time.time() - start_time
