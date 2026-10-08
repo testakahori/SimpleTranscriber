@@ -22,7 +22,7 @@ from pathlib import Path
 import gradio as gr
 import httpx
 
-from core import audio, config, diarization, glossary, llm, minutes, output, people, transcriber
+from core import audio, config, diarization, glossary, llm, minutes, noise_profile, output, people, transcriber
 from core import export as export_mod
 from core import search as search_mod
 from core import utterances as U
@@ -35,6 +35,42 @@ config.ensure_dirs()
 
 FILE_TYPES = [f".{e.lstrip('.')}" for e in audio.SUPPORTED_EXTS]
 SPEAKER_COUNT_CHOICES = [("自動", 0)] + [(f"{n}人", n) for n in range(1, 11)]
+
+
+def preview_noise_sample(source, start, end):
+    """見本にする範囲だけを原音から切り出して確認する。"""
+    import subprocess
+    import tempfile
+    if not source:
+        raise gr.Error("元音声を選んでください")
+    try:
+        a, b = noise_profile.seconds(start), noise_profile.seconds(end)
+        if not 0.5 <= b - a <= 30:
+            raise ValueError("0.5〜30秒の範囲を選んでください")
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        subprocess.run([audio.find_ffmpeg(), "-y", "-ss", str(a), "-i", source, "-t", str(b - a),
+                        "-vn", "-ac", "1", "-ar", "16000", tmp.name],
+                       capture_output=True, check=True)
+        if audio.get_duration(tmp.name) < 0.5:
+            raise ValueError("選択した区間が録音の外にあります")
+        return tmp.name
+    except (ValueError, subprocess.SubprocessError) as e:
+        raise gr.Error(str(e)) from e
+
+
+def apply_noise_sample(source, start, end, strength, progress=gr.Progress()):
+    import uuid
+    if not source:
+        raise gr.Error("元音声を選んでください")
+    folder = config.OUTPUT_DIR / (datetime.datetime.now().strftime("noise_profile_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6])
+    try:
+        result = noise_profile.create_trial(source, start, end, folder, strength / 100,
+                                            progress=lambda f: progress(f, desc="ノイズの見本を使って全体を補正中"))
+    except (ValueError, audio.AudioError) as e:
+        raise gr.Error(str(e)) from e
+    return (f"保存しました: `{result['folder']}`。削った音に説明者の言葉があれば、強さを下げてください。",
+            str(folder / "reduced.wav"), str(folder / "removed.wav"), str(folder / "reduced.wav"))
 
 
 def _rows(df) -> list[list]:
@@ -1022,6 +1058,25 @@ def build_ui():
                         doc_status = gr.Markdown()
 
             # ======================== SRT編集 ========================
+            with gr.Tab("🔈 ノイズの見本で補正"):
+                gr.Markdown("説明者が話しておらず、環境音だけが聞こえる範囲を選びます。"
+                            "人のざわめきは声と重なるため、強く消すと発言まで削れることがあります。")
+                noise_source = gr.Audio(label="元音声（再生して範囲を確認）", sources=["upload"], type="filepath")
+                with gr.Row():
+                    noise_start = gr.Textbox(label="見本の開始（秒数・分:秒）", value="0:00")
+                    noise_end = gr.Textbox(label="見本の終了（0.5〜30秒の範囲）", value="0:05")
+                noise_preview_btn = gr.Button("選んだ範囲だけを聞く")
+                noise_sample_player = gr.Audio(label="ノイズに指定する範囲", interactive=False)
+                noise_strength = gr.Slider(0, 80, value=35, step=5, label="除去の強さ（まずは弱めの35）")
+                noise_apply_btn = gr.Button("この見本で音声全体のノイズを弱める", variant="primary")
+                noise_status = gr.Markdown()
+                with gr.Row():
+                    noise_reduced = gr.Audio(label="除去後", interactive=False)
+                    noise_removed = gr.Audio(label="削った音（ここに説明者の声がないか確認）", interactive=False)
+                noise_download = gr.File(label="補正音声を保存", interactive=False)
+                gr.Markdown("元音声は変更しません。補正音声で文字起こしする場合は、"
+                            "文字起こしタブにこのファイルを指定し、「背景ノイズ除去」をOFFにして二重処理を避けてください。")
+
             with gr.Tab("🎬 字幕(SRT)編集"):
                 gr.Markdown("単語ごとのタイミングから、読みやすい長さ・区切りで字幕を自動生成します。"
                             "時刻は `HH:MM:SS,mmm` 形式で直接編集できます。")
@@ -1187,6 +1242,11 @@ def build_ui():
         # ======================== イベント ========================
         view_outputs = [transcript_html, minutes_view, insights_view,
                         dl_transcript, dl_minutes, dl_srt, speaker_table, edit_table]
+
+        noise_preview_btn.click(fn=preview_noise_sample, inputs=[noise_source, noise_start, noise_end],
+                                outputs=noise_sample_player)
+        noise_apply_btn.click(fn=apply_noise_sample, inputs=[noise_source, noise_start, noise_end, noise_strength],
+                              outputs=[noise_status, noise_reduced, noise_removed, noise_download])
 
         start_btn.click(
             fn=run_batch,

@@ -77,4 +77,41 @@ Qwenの最大GPUテンソル割当は4146 MiB、最大予約領域は4596 MiBで
 - `output/qwen_trial_20261008_noisy/comparison.html`
 - `output/qwen_trial_20261008_clean/comparison.html`
 
-CPUで動く回帰テストは `venv\Scripts\python.exe -m unittest discover -s tests -v`（14件）。抜け区間の切り出し・時間上限・比較する単語の範囲・HTMLのエスケープ・タイムアウト時の子プロセス停止と、既存の文字起こし処理を確認しています。
+CPUで動く回帰テストは `venv\Scripts\python.exe -m unittest discover -s tests -v`。抜け区間の切り出し・時間上限・比較する単語の範囲・HTMLのエスケープ・タイムアウト時の子プロセス停止と、既存の文字起こし処理を確認しています。
+
+## 全編を比較し、途中結果も保存する
+
+`tools/full_asr_experiment.py` は、WhisperとQwenで全編をそれぞれ認識し、Qwenの文をgemma4で校正する別の実験です。対象を抜けの候補だけに絞る前節とは異なります。Qwenは重複しない30秒窓なので、Whisperとは区切り方が異なり、窓の境界の語が欠けることがあります。モデルだけの厳密な精度比較ではありません。
+
+新しいフォルダで前処理し、各コマンドが正常終了してから次を実行してください。WhisperとQwenは同じ `asr.wav` を使います。
+
+```powershell
+.\venv\Scripts\python.exe tools\full_asr_experiment.py prepare output\full_asr_trial_01 --audio "D:\録音\meeting.m4a"
+.\venv\Scripts\python.exe tools\full_asr_experiment.py whisper output\full_asr_trial_01
+.\.venv-qwen\Scripts\python.exe tools\full_asr_experiment.py qwen output\full_asr_trial_01
+.\venv\Scripts\python.exe tools\full_asr_experiment.py gemma output\full_asr_trial_01
+.\venv\Scripts\python.exe tools\report_full_asr_experiment.py output\full_asr_trial_01
+```
+
+- Whisperは約10秒ごと、Qwenは1窓ごと、gemma4は約2500字ごとに途中結果を保存します。JSONは一時ファイルを完全に書いてから置き換えます。ディスクへの保存失敗は処理を止めて通知します。
+- 完了済みのstageは同じコマンドで再計算しません。Qwenは未処理の窓、gemma4は未処理の行から再開できます。**Whisperが中断された場合は先頭から再計算**しますが、途中の文字は `01_Whisper_途中経過.md` に残ります。再実行前に必要な途中結果を別名で保管してください。
+- フォルダ内の音声・入力JSONを途中で差し替えないでください。設定を変えた比較は別フォルダで行います。
+- Qwenの空文字・生成上限・同じ語の4回以上の反復を含む窓は `unsafe` とし、gemma4へ渡さず原文を残します。この判定は正誤判定ではなく、確認の目印です。
+- gemma4が推測と印を付けた箇所はMarkdownで `⟦ ⟧` を残します。校正への入力・モデルが返した原文も `gemma_calls/` に保存します。校正ガードで採用されなかった案も追跡できます。
+- 最後のコマンドは、全編が完了していることを検証し、`実験レポート.md`・`comparison.html`・`校正変更一覧.md`・集計JSONを作ります。HTMLでは区間の音声、3段階の文、校正差分を確認できます。
+
+### 雑音で無音スキップが繰り返される場合の試験設定
+
+2026-10-08の全編試験で、faster-whisper 1.2.1 の `hallucination_silence_threshold=2.0` が、誤認らしい窓で1秒ずつしか進まず周辺を繰り返し認識する現象を観測しました。スタックで圧縮後の音声位置が481.24→482.24→483.24秒と進んでいました。
+
+試験フォルダの `experiment-options.json` に次を保存してからWhisperを実行すると、その内部スキップだけを無効にできます。
+
+```json
+{"silence_guard": false}
+```
+
+VAD、主処理の温度試行、外側の誤認除外、抜けの再認識は維持します。内部で消していた怪しい文が出力に残る可能性があるため、**通常アプリの既定設定は変更していません**。試験のJSON・Markdownには使用設定を記録します。
+
+62分14秒の全編試験では、この設定のWhisperが18分42秒、Qwenが7分39秒、gemma4が6分33秒で完了しました。前処理込み33.5分（中断した最初の試行と診断を含めると41.6分）。Whisper 13731字→Qwen 16204字→gemma4 16072字ですが、正解文との比較ではないため精度改善率ではありません。Qwen125窓のうち生成上限等の21窓は校正対象外として原文を保持し、残り104窓をgemma4へ渡しました。
+
+全データとレポートは `output/20261008_会議_7_全編実験/` に保存しています。追加した「冒頭10秒をノイズ見本にする」試験では、固定した6窓で認識の明確な改善を確認できず、常用は見送りました。結果の詳細と判断は [引継ぎの書](引継ぎの書.md) を参照してください。
