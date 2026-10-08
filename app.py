@@ -173,7 +173,7 @@ def _write_meta(job: dict, opts: dict, settings: dict) -> None:
 
 
 def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on,
-              meeting_date, memo, progress=gr.Progress()):
+              meeting_date, memo, decoding="stable", progress=gr.Progress()):
     """① 音声 → 文字起こし（話者識別まで）。AIの校正・議事録は②③で別に行う"""
     if not files:
         return ("⚠️ ファイルを選択してください。", gr.update()) + \
@@ -182,6 +182,7 @@ def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fi
     settings = config.load_settings()
     opts = {
         "model": model_name, "speed": speed, "language": language, "num_speakers": num_speakers,
+        "decoding": decoding,
         "noise": noise, "eq": eq_on, "fillers": fillers_on, "diarize": diarize_on, "use_llm": False,
         "meeting_date": (meeting_date or "").strip(), "memo": (memo or "").strip(),
     }
@@ -932,6 +933,12 @@ def build_ui():
                             label="会議メモ（任意・議事録AIへのヒント）", lines=2,
                             placeholder="例: 清風学園との定例。参加者は坪内、岡田、平岡…")
                         with gr.Accordion("詳細オプション", open=False):
+                            decoding_radio = gr.Radio(
+                                transcriber.DECODING_CHOICES,
+                                value=settings["whisper"].get("decoding", "stable"),
+                                label="認識方式",
+                                info="推奨方式は前の誤認識を引きずりにくくします。人名・用語の表記が崩れる録音では"
+                                     "従来方式も試せます。高速モードではこの選択は使いません。")
                             lang_dd = gr.Dropdown(
                                 ["ja", "auto"], value=settings["whisper"]["language"],
                                 label="言語", info="ja=日本語固定（推奨）")
@@ -1184,7 +1191,7 @@ def build_ui():
         start_btn.click(
             fn=run_batch,
             inputs=[files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, eq_cb, fillers_cb, diarize_cb,
-                    meeting_date_box, memo_box],
+                    meeting_date_box, memo_box, decoding_radio],
             outputs=[result_md, job_state] + view_outputs + [history_dd],
         ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
 
