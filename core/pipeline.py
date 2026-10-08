@@ -107,6 +107,7 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
             initial_prompt=glossary.build_initial_prompt(terms),
             hotwords=glossary.build_hotwords(terms),
             duration=duration, speed=opts.get("speed", "accurate"),
+            decoding=opts.get("decoding", settings.get("whisper", {}).get("decoding", "stable")),
             progress_cb=lambda f, desc=None: sub(0.05 + 0.75 * f, desc or f"文字起こし中... {int(f * 100)}%"),
         )
         punctuate.punctuate_segments(result["segments"])  # 「、」「。」を推定して補う
@@ -151,6 +152,9 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
 
     speed_label = dict((v, k) for k, v in transcriber.SPEED_CHOICES).get(result.get("speed"), "")
     meta_line = f"モデル: {result.get('model')}（{result.get('device')}・{speed_label.split('（')[0]}）"
+    decoding_label = dict((v, k) for k, v in transcriber.DECODING_CHOICES).get(result.get("decoding"))
+    if decoding_label:
+        meta_line += f" ／ 認識方式: {decoding_label}"
     job = {
         "job_dir": str(job_dir),
         "source": name,
@@ -165,6 +169,7 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
         "matched": matched,
         "stats": {
             "whisper_model": result.get("model"),
+            "asr_decoding": result.get("decoding"),
             "device": result.get("device"),
             "hallucinations_dropped": result.get("dropped", 0),
             "asr_refilled_sec": result.get("refilled_sec", 0.0),

@@ -26,6 +26,7 @@ DEFAULTS = {
         "model": "auto",  # auto | large-v3 | large-v3-turbo | kotoba-whisper-v2.0 | medium | small
         "language": "ja",  # ja | auto
         "speed": "accurate",  # accurate | balanced | fast
+        "decoding": "stable",  # stable: 抜け・繰り返し抑制 | context: 従来の文脈・用語優先
     },
     "audio": {
         "asr_eq": True,            # 文字起こし前に低音(80Hz未満)・高域(7kHz超)をカット

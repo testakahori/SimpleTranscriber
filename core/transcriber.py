@@ -15,6 +15,8 @@ MODEL_CHOICES = ["auto", "large-v3", "large-v3-turbo", "kotoba-whisper-v2.0", "m
 #   fast:     16区間まとめて処理(batched)   … 約8倍速・取りこぼし約15%増
 SPEED_CHOICES = [("精度優先（遅い）", "accurate"), ("バランス（約2.4倍速）", "balanced"),
                  ("高速（約8倍速・取りこぼしと句読点が少し増減）", "fast")]
+DECODING_CHOICES = [("抜け・繰り返しを抑える（推奨）", "stable"),
+                    ("文脈・用語ヒントを優先（従来方式）", "context")]
 MODEL_IDS = {
     "kotoba-whisper-v2.0": "kotoba-tech/kotoba-whisper-v2.0-faster",
 }
@@ -250,7 +252,7 @@ def _fill_gaps(model, wav_path: str, segments: list[dict], total: float, kwargs:
 
 def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
                initial_prompt: str = "", hotwords: str = "", duration: float = 0.0,
-               progress_cb=None, speed: str = "accurate") -> dict:
+               progress_cb=None, speed: str = "accurate", decoding: str = "stable") -> dict:
     """文字起こしを実行し、単語レベル確信度付きのセグメント一覧を返す。
 
     Returns:
@@ -262,6 +264,8 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
           ]
         }
     """
+    if decoding not in {value for _, value in DECODING_CHOICES}:
+        raise ValueError(f"不明な認識方式: {decoding}")
     device, _ = detect_device()
     name = resolve_model_name(model_name, device)
     model = get_model(name)
@@ -270,9 +274,9 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
         beam_size=5,
         best_of=5,
         word_timestamps=True,
-        # 前の発言を文脈として使う（精度と句読点が安定する）。
-        # 同じ文のループは compression_ratio / 無音判定のフィルタで除外する
-        condition_on_previous_text=True,
+        # 雑音で崩れた認識を次の窓へ引き継ぐと、繰り返しや長い抜けが続く。
+        # stableでは窓ごとにリセットする。温度の再試行は既定の6段を維持する。
+        condition_on_previous_text=decoding == "context",
         # 無音が続く所で捏造された単語をスキップ
         hallucination_silence_threshold=2.0,
         vad_filter=True,
@@ -295,7 +299,9 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
             kwargs.update(beam_size=1, best_of=1)
         # 句読点付きのお手本を与えると、Whisperが「、」「。」を付けやすくなる
         kwargs["initial_prompt"] = (PUNCT_PROMPT + (initial_prompt or ""))[:800]
-        if hotwords:
+        # hotwordsは全窓に繰り返し入るので、聞き取れない所で人名一覧を捏造しやすい。
+        # stableでも最初の窓のinitial_promptは残し、用語の手掛かりを与える。
+        if hotwords and decoding == "context":
             kwargs["hotwords"] = hotwords[:500]
 
     start_time = time.time()
@@ -333,6 +339,7 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
         "elapsed": elapsed,
         "model": name,
         "speed": speed,
+        "decoding": "batched" if speed == "fast" else decoding,
         "device": device,
         "dropped": dropped,
         "refilled_sec": fill["refilled_sec"],
