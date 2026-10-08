@@ -65,14 +65,18 @@ class TranscriptionModesTest(unittest.TestCase):
         self.assertIn(t.PUNCT_PROMPT, options["initial_prompt"])
         self.assertEqual(result["decoding"], "context")
 
-    def test_experiment_can_disable_internal_silence_skip_without_reducing_fallbacks(self):
-        result, options, retry = self.run_transcription(silence_guard=False)
-        self.assertIsNone(options["hallucination_silence_threshold"])
-        self.assertTrue(options["vad_filter"])
-        self.assertTrue(options["word_timestamps"])
-        self.assertNotIn("temperature", options)
-        self.assertFalse(result["silence_guard"])
-        self.assertIsNone(retry["hallucination_silence_threshold"])
+    def test_internal_silence_skip_toggle_keeps_vad_and_fallbacks(self):
+        for speed in ("accurate", "balanced"):
+            for enabled in (False, True):
+                with self.subTest(speed=speed, enabled=enabled):
+                    result, options, retry = self.run_transcription(speed=speed, silence_guard=enabled)
+                    threshold = 2.0 if enabled else None
+                    self.assertEqual(options["hallucination_silence_threshold"], threshold)
+                    self.assertTrue(options["vad_filter"])
+                    self.assertTrue(options["word_timestamps"])
+                    self.assertNotIn("temperature", options)
+                    self.assertIs(result["silence_guard"], enabled)
+                    self.assertEqual(retry["hallucination_silence_threshold"], threshold)
 
     def test_balanced_keeps_its_beam_width(self):
         _, options, _ = self.run_transcription(speed="balanced")
@@ -86,9 +90,11 @@ class TranscriptionModesTest(unittest.TestCase):
         with patch.dict(sys.modules, {"faster_whisper": fake_module}):
             result, _, retry = self.run_transcription(speed="fast", decoding="context")
         options = batched.transcribe.call_args.kwargs
-        for key in ("hotwords", "initial_prompt", "condition_on_previous_text", "best_of"):
+        for key in ("hotwords", "initial_prompt", "condition_on_previous_text", "best_of",
+                    "hallucination_silence_threshold"):
             self.assertNotIn(key, options)
         self.assertEqual(result["decoding"], "batched")
+        self.assertIsNone(result["silence_guard"])
         self.assertNotIn("batch_size", retry)
         self.assertNotIn("chunk_length", retry)
 
@@ -104,6 +110,10 @@ class TranscriptionModesTest(unittest.TestCase):
         merged = config._deep_merge(config.DEFAULTS, {"whisper": {"decoding": "context"}})
         self.assertEqual(merged["whisper"]["decoding"], "context")
         self.assertEqual(config.DEFAULTS["whisper"]["decoding"], "stable")
+        self.assertTrue(merged["whisper"]["silence_guard"])
+        merged = config._deep_merge(config.DEFAULTS, {"whisper": {"silence_guard": False}})
+        self.assertFalse(merged["whisper"]["silence_guard"])
+        self.assertTrue(config.DEFAULTS["whisper"]["silence_guard"])
 
 
 class GapRecoveryTest(unittest.TestCase):

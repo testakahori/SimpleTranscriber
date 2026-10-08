@@ -209,7 +209,7 @@ def _write_meta(job: dict, opts: dict, settings: dict) -> None:
 
 
 def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on,
-              meeting_date, memo, decoding="stable", progress=gr.Progress()):
+              meeting_date, memo, decoding="stable", silence_guard=True, progress=gr.Progress()):
     """① 音声 → 文字起こし（話者識別まで）。AIの校正・議事録は②③で別に行う"""
     if not files:
         return ("⚠️ ファイルを選択してください。", gr.update()) + \
@@ -218,7 +218,7 @@ def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fi
     settings = config.load_settings()
     opts = {
         "model": model_name, "speed": speed, "language": language, "num_speakers": num_speakers,
-        "decoding": decoding,
+        "decoding": decoding, "silence_guard": silence_guard,
         "noise": noise, "eq": eq_on, "fillers": fillers_on, "diarize": diarize_on, "use_llm": False,
         "meeting_date": (meeting_date or "").strip(), "memo": (memo or "").strip(),
     }
@@ -975,6 +975,12 @@ def build_ui():
                                 label="認識方式",
                                 info="推奨方式は前の誤認識を引きずりにくくします。人名・用語の表記が崩れる録音では"
                                      "従来方式も試せます。高速モードではこの選択は使いません。")
+                            silence_guard_cb = gr.Checkbox(
+                                value=settings["whisper"].get("silence_guard", True),
+                                interactive=settings["whisper"].get("speed", "accurate") != "fast",
+                                label="無音付近の誤認識を除外（内部スキップ）",
+                                info="ONは従来の動作。雑音で処理が進まないときはOFFを試してください（全編実験の設定）。"
+                                     "OFFでは誤った文が残ることがあります。高速モードには適用しません。")
                             lang_dd = gr.Dropdown(
                                 ["ja", "auto"], value=settings["whisper"]["language"],
                                 label="言語", info="ja=日本語固定（推奨）")
@@ -1251,9 +1257,12 @@ def build_ui():
         start_btn.click(
             fn=run_batch,
             inputs=[files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, eq_cb, fillers_cb, diarize_cb,
-                    meeting_date_box, memo_box, decoding_radio],
+                    meeting_date_box, memo_box, decoding_radio, silence_guard_cb],
             outputs=[result_md, job_state] + view_outputs + [history_dd],
         ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
+
+        speed_radio.change(fn=lambda speed: gr.update(interactive=speed != "fast"),
+                           inputs=speed_radio, outputs=silence_guard_cb, queue=False)
 
         history_dd.input(fn=open_job, inputs=history_dd,
                          outputs=[result_md, job_state] + view_outputs
@@ -1326,9 +1335,8 @@ def build_ui():
     return demo
 
 
-demo = build_ui()
-
 if __name__ == "__main__":
+    demo = build_ui()
     print("==========================================================")
     print("Ready. Browser will open automatically.")
     print("==========================================================")

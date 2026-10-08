@@ -27,6 +27,7 @@ DEFAULTS = {
         "language": "ja",  # ja | auto
         "speed": "accurate",  # accurate | balanced | fast
         "decoding": "stable",  # stable: 抜け・繰り返し抑制 | context: 従来の文脈・用語優先
+        "silence_guard": True,  # 無音付近の誤認識を内部で除外。雑音で停滞する録音ではOFFを試す
     },
     "audio": {
         "asr_eq": True,            # 文字起こし前に低音(80Hz未満)・高域(7kHz超)をカット
