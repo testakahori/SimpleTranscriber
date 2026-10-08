@@ -108,6 +108,7 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
             hotwords=glossary.build_hotwords(terms),
             duration=duration, speed=opts.get("speed", "accurate"),
             decoding=opts.get("decoding", settings.get("whisper", {}).get("decoding", "stable")),
+            silence_guard=opts.get("silence_guard", settings.get("whisper", {}).get("silence_guard", True)),
             progress_cb=lambda f, desc=None: sub(0.05 + 0.75 * f, desc or f"文字起こし中... {int(f * 100)}%"),
         )
         punctuate.punctuate_segments(result["segments"])  # 「、」「。」を推定して補う
@@ -155,6 +156,11 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
     decoding_label = dict((v, k) for k, v in transcriber.DECODING_CHOICES).get(result.get("decoding"))
     if decoding_label:
         meta_line += f" ／ 認識方式: {decoding_label}"
+    silence_guard = result.get("silence_guard")
+    if result.get("speed") == "fast":
+        meta_line += " ／ 内部スキップ: 対象外（高速モード）"
+    elif silence_guard is not None:
+        meta_line += f" ／ 内部スキップ: {'ON' if silence_guard else 'OFF'}"
     job = {
         "job_dir": str(job_dir),
         "source": name,
@@ -170,6 +176,7 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
         "stats": {
             "whisper_model": result.get("model"),
             "asr_decoding": result.get("decoding"),
+            "asr_silence_guard": silence_guard,
             "device": result.get("device"),
             "hallucinations_dropped": result.get("dropped", 0),
             "asr_refilled_sec": result.get("refilled_sec", 0.0),

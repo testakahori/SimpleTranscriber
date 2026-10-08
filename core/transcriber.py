@@ -262,7 +262,7 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
     checkpoint_cb: 認識済みの中間結果を同期的に受け取る任意の保存関数。
         呼び出し側で保存頻度を制御する。保存失敗は握りつぶさず呼び出し元へ返す。
     silence_guard: faster-whisper内の無音に囲まれた誤認のスキップ。
-        雑音で1秒刻みの再認識が続く場合の比較用に無効化できる。VAD・外側の除外は維持。
+        雑音で1秒刻みの再認識が続く場合は無効化できる。VAD・外側の除外は維持。
     Returns:
         {
           "language": str, "duration": float, "elapsed": float,
