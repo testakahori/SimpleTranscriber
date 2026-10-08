@@ -63,6 +63,8 @@ Ollama がなくても①の文字起こしと話者識別は動きます。
 
 使った認識方式は結果の文字起こしと `meta.json` の `asr_decoding` に記録します。既定を変える場合は `settings.yaml` の `whisper.decoding` を `stable`（推奨）または `context`（従来方式）に設定します。
 
+**Qwenで聞き直す比較試験**も用意しています。Whisperで抜けた区間などをQwen3-ASR-1.7Bで認識し、必要ならgemma4で校正した候補まで並べて確認できます。独立した環境で動く試験用コマンドで、元の結果には自動適用しません。[導入手順・試験結果](docs/Qwen導入と比較.md)を参照してください。
+
 ## 話者識別・声紋登録
 
 **高精度の pyannote を使う場合**: Hugging Face で [speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) と [segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) の利用規約に同意し、発行したトークン（Read）を「⚙️ 設定」に入れてください。トークンがなくても、自前の声紋クラスタリングで動きます。
