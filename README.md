@@ -65,6 +65,20 @@ Ollama がなくても①の文字起こしと話者識別は動きます。
 
 **Qwenで聞き直す比較試験**も用意しています。Whisperで抜けた区間などをQwen3-ASR-1.7Bで認識し、必要ならgemma4で校正した候補まで並べて確認できます。独立した環境で動く試験用コマンドで、元の結果には自動適用しません。[導入手順・試験結果](docs/Qwen導入と比較.md)を参照してください。
 
+## 環境音の区間を選んでノイズを減らす
+
+「🔈 ノイズの見本で補正」タブで音声を入れ、説明者が話していない区間の開始・終了を指定します。秒数・`分:秒`・`時:分:秒`に対応します。「選んだ範囲だけを聞く」で見本を確認し、弱めの35から全体の除去を試してください。
+
+除去後の音声に加え、削った音も `output/noise_profile_日時/` に保存します。**削った音に説明者の言葉が聞こえたら、除去を弱めるか見本を変えてください。** 人のざわめきは説明者の声と重なるため、この方法でも完全には分離できません。元音声は上書きしません。
+
+同じ処理をコマンドでも実行できます（新しい出力フォルダを指定）。
+
+```powershell
+.\venv\Scripts\python.exe tools\try_noise_profile.py --audio "meeting.m4a" --start 0:00 --end 0:10 --strength 0.35 --output output\noise_trial_01
+```
+
+この見本方式は、現在の自動ノイズ除去とは別です。実装は[noisereduceの定常ノイズ処理](https://github.com/timsainb/noisereduce)を使っています。[Audacityの説明](https://manual.audacityteam.org/man/noise_reduction.html)にもあるように、時間で変わるざわめきや声と重なる音では、強く掛けるほど発言まで失う可能性があります。
+
 ## 話者識別・声紋登録
 
 **高精度の pyannote を使う場合**: Hugging Face で [speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) と [segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) の利用規約に同意し、発行したトークン（Read）を「⚙️ 設定」に入れてください。トークンがなくても、自前の声紋クラスタリングで動きます。

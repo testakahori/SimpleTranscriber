@@ -16,6 +16,26 @@ def segment(text="確認しました。", start=0.0, end=2.0):
 
 
 class TranscriptionModesTest(unittest.TestCase):
+    def test_checkpoint_preserves_main_pass_before_recovery_failure(self):
+        model = Mock()
+        model.transcribe.return_value = (iter([segment()]), SimpleNamespace(duration=10, language="ja"))
+        saved = []
+        with patch.object(t, "detect_device", return_value=("cpu", "int8")), \
+                patch.object(t, "get_model", return_value=model), \
+                patch.object(t, "_fill_gaps", side_effect=RuntimeError("recovery failed")):
+            with self.assertRaisesRegex(RuntimeError, "recovery failed"):
+                t.transcribe("unused.wav", checkpoint_cb=lambda value: saved.append(dict(value)))
+        self.assertEqual(saved[-1]["phase"], "main_complete")
+        self.assertEqual(saved[-1]["segments"][0]["text"], "確認しました。")
+
+    def test_checkpoint_write_errors_are_not_silenced(self):
+        model = Mock()
+        model.transcribe.return_value = (iter([segment()]), SimpleNamespace(duration=10, language="ja"))
+        with patch.object(t, "detect_device", return_value=("cpu", "int8")), \
+                patch.object(t, "get_model", return_value=model):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                t.transcribe("unused.wav", checkpoint_cb=Mock(side_effect=OSError("disk full")))
+
     def run_transcription(self, **options):
         model = Mock()
         model.transcribe.return_value = (iter([segment()]), SimpleNamespace(duration=10, language="ja"))
@@ -44,6 +64,15 @@ class TranscriptionModesTest(unittest.TestCase):
         self.assertEqual(options["hotwords"], "テスト用語")
         self.assertIn(t.PUNCT_PROMPT, options["initial_prompt"])
         self.assertEqual(result["decoding"], "context")
+
+    def test_experiment_can_disable_internal_silence_skip_without_reducing_fallbacks(self):
+        result, options, retry = self.run_transcription(silence_guard=False)
+        self.assertIsNone(options["hallucination_silence_threshold"])
+        self.assertTrue(options["vad_filter"])
+        self.assertTrue(options["word_timestamps"])
+        self.assertNotIn("temperature", options)
+        self.assertFalse(result["silence_guard"])
+        self.assertIsNone(retry["hallucination_silence_threshold"])
 
     def test_balanced_keeps_its_beam_width(self):
         _, options, _ = self.run_transcription(speed="balanced")
@@ -86,10 +115,12 @@ class GapRecoveryTest(unittest.TestCase):
         fake_sf = SimpleNamespace(info=lambda _: SimpleNamespace(samplerate=16000),
                                   read=lambda *a, **k: (SimpleNamespace(ndim=1), 16000))
         segments = [{"start": 1.0, "end": 2.0, "text": "既存", "words": []}]
+        checkpoint = Mock()
         with patch.dict(sys.modules, {"soundfile": fake_sf}), \
                 patch.object(t, "_missed_spans", side_effect=[[(10.0, 14.0)], []]):
             result = t._fill_gaps(model, "unused.wav", segments, 20,
-                                  dict(initial_prompt="用語", hotwords="用語", condition_on_previous_text=True))
+                                  dict(initial_prompt="用語", hotwords="用語", condition_on_previous_text=True),
+                                  checkpoint_cb=checkpoint)
         options = model.transcribe.call_args.kwargs
         self.assertFalse(options["condition_on_previous_text"])
         self.assertNotIn("initial_prompt", options)
@@ -99,6 +130,10 @@ class GapRecoveryTest(unittest.TestCase):
         self.assertEqual([s["text"] for s in segments], ["既存", "追加"])
         self.assertEqual(segments[1]["words"][0]["start"], 10.0)
         self.assertEqual(result["missing_sec"], 0)
+        saved = checkpoint.call_args.args[0]
+        self.assertEqual(saved["phase"], "recovery")
+        self.assertEqual(saved["completed_spans"], 1)
+        self.assertEqual([s["text"] for s in saved["segments"]], ["既存", "追加"])
 
 
 if __name__ == "__main__":

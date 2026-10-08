@@ -186,7 +186,7 @@ def _missed_spans(wav_path: str, segments: list[dict], total: float) -> list[tup
 
 
 def _fill_gaps(model, wav_path: str, segments: list[dict], total: float, kwargs: dict,
-               progress_cb=None) -> dict:
+               progress_cb=None, checkpoint_cb=None) -> dict:
     """声があるのに文字が無い部分を、前の文脈を使わずにもう一度文字起こしして segments に足す。
 
     Whisperは「無音らしく自信も低い」30秒窓を黙って飛ばす。前の発言を文脈にしていると、
@@ -238,6 +238,9 @@ def _fill_gaps(model, wav_path: str, segments: list[dict], total: float, kwargs:
         if n:
             stats["refilled_sec"] += b - a
             logging.warning(f"文字起こしの抜けを補いました: {a:.0f}s〜{b:.0f}s（{n}区間）")
+        if checkpoint_cb:
+            checkpoint_cb({"phase": "recovery", "segments": sorted(segments + added, key=lambda s: s["start"]),
+                           "duration": total, "completed_spans": i + 1, "total_spans": len(spans)})
     segments.extend(added)
     segments.sort(key=lambda s: s["start"])
     remain = _missed_spans(wav_path, segments, total)
@@ -252,9 +255,14 @@ def _fill_gaps(model, wav_path: str, segments: list[dict], total: float, kwargs:
 
 def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
                initial_prompt: str = "", hotwords: str = "", duration: float = 0.0,
-               progress_cb=None, speed: str = "accurate", decoding: str = "stable") -> dict:
+               progress_cb=None, speed: str = "accurate", decoding: str = "stable",
+               checkpoint_cb=None, silence_guard: bool = True) -> dict:
     """文字起こしを実行し、単語レベル確信度付きのセグメント一覧を返す。
 
+    checkpoint_cb: 認識済みの中間結果を同期的に受け取る任意の保存関数。
+        呼び出し側で保存頻度を制御する。保存失敗は握りつぶさず呼び出し元へ返す。
+    silence_guard: faster-whisper内の無音に囲まれた誤認のスキップ。
+        雑音で1秒刻みの再認識が続く場合の比較用に無効化できる。VAD・外側の除外は維持。
     Returns:
         {
           "language": str, "duration": float, "elapsed": float,
@@ -278,7 +286,7 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
         # stableでは窓ごとにリセットする。温度の再試行は既定の6段を維持する。
         condition_on_previous_text=decoding == "context",
         # 無音が続く所で捏造された単語をスキップ
-        hallucination_silence_threshold=2.0,
+        hallucination_silence_threshold=2.0 if silence_guard else None,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=300),
     )
@@ -319,16 +327,24 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
         if _is_hallucination(seg):
             dropped += 1
             logging.info(f"ハルシネーション疑いを除外: [{seg.start:.1f}s] {seg.text.strip()[:40]}")
-            continue
-        segments.append(_segment_dict(seg))
+        else:
+            segments.append(_segment_dict(seg))
+        if checkpoint_cb:
+            checkpoint_cb({"phase": "main", "segments": segments, "duration": total,
+                           "processed_sec": float(seg.end), "dropped": dropped})
         logging.info(f"進捗: [{seg.start:.1f}s -> {seg.end:.1f}s]")
+
+    if checkpoint_cb:
+        checkpoint_cb({"phase": "main_complete", "segments": segments, "duration": total,
+                       "processed_sec": total, "dropped": dropped})
 
     retry_kwargs = {k: v for k, v in kwargs.items() if k not in ("batch_size", "chunk_length")}
     fill_cb = None
     if progress_cb:
         def fill_cb(f, desc):
             progress_cb(MAIN_PASS_SHARE + (1 - MAIN_PASS_SHARE) * f, desc)
-    fill = _fill_gaps(model, wav_path, segments, total, retry_kwargs, progress_cb=fill_cb)
+    fill = _fill_gaps(model, wav_path, segments, total, retry_kwargs,
+                      progress_cb=fill_cb, checkpoint_cb=checkpoint_cb)
     dropped += fill["dropped"]
 
     elapsed = time.time() - start_time
@@ -340,6 +356,7 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
         "model": name,
         "speed": speed,
         "decoding": "batched" if speed == "fast" else decoding,
+        "silence_guard": silence_guard if speed != "fast" else None,
         "device": device,
         "dropped": dropped,
         "refilled_sec": fill["refilled_sec"],
