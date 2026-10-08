@@ -1,0 +1,8 @@
+# Optional Qwen trial runtime. Install in .venv-qwen; keep the main venv unchanged.
+# Windows / NVIDIA GPU trial. Use the CUDA index described in the documentation.
+torch==2.14.0+cu130
+transformers==5.19.0
+accelerate==1.15.0
+soundfile
+librosa
+truststore
