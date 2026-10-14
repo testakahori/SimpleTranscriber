@@ -9,7 +9,7 @@ import logging
 import re
 from pathlib import Path
 
-from . import audio, checkpoints, config, diarization, glossary, output, people, punctuate, transcriber
+from . import audio, checkpoints, config, diarization, glossary, output, people, punctuate, run_control, transcriber
 from . import utterances as U
 
 
@@ -99,13 +99,13 @@ def _run_options(opts, settings):
     return {key: opts.get(key, default) for key, default in values.items()}
 
 
-def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
+def _transcribe_one(path: str, opts: dict, settings: dict, sub, pause_file=None) -> dict:
     job_dir = output.create_job_dir(Path(path).name)
     with checkpoints.job_lock(job_dir):
-        return _run_transcription(job_dir, path, _run_options(opts, settings), settings, sub)
+        return _run_transcription(job_dir, path, _run_options(opts, settings), settings, sub, pause_file=pause_file)
 
 
-def resume_job(job_dir: str, paths: list[str], opts: dict, settings: dict, progress=None) -> dict:
+def resume_job(job_dir: str, paths: list[str], opts: dict, settings: dict, progress=None, pause_file=None) -> dict:
     """別プロセスから、同じ保存先・同じ音声・同じ認識設定で続きを実行する。"""
     folder = Path(job_dir)
     with checkpoints.job_lock(folder):
@@ -127,13 +127,14 @@ def resume_job(job_dir: str, paths: list[str], opts: dict, settings: dict, progr
             path = paths[0]
             opts = _run_options(opts, settings)
         opts.update(meeting_date=data.get("meeting_date", ""), memo=data.get("memo", ""))
-        return _run_transcription(folder, path, opts, settings, progress or (lambda f, d: None), data)
+        return _run_transcription(folder, path, opts, settings, progress or (lambda f, d: None), data, pause_file)
 
 
-def _run_transcription(job_dir, path, opts, settings, sub, resume=None):
+def _run_transcription(job_dir, path, opts, settings, sub, resume=None, pause_file=None):
     name = resume["source"] if resume else Path(path).name
     temporary = set()
     checkpoint = None
+    pause = lambda: run_control.check(pause_file)
     try:
         people_list = people.load_people()
         if resume and resume.get("resume_audio"):
@@ -165,9 +166,11 @@ def _run_transcription(job_dir, path, opts, settings, sub, resume=None):
                                    "diarization": {key: settings.get("diarization", {}).get(key, default)
                                                    for key, default in (("max_speakers", 12), ("match_similarity", 0.55), ("auto_learn", True))},
                                })
-        checkpoint({**(resume or dict(phase="prepared", segments=[], processed_sec=0)), "interrupted": False})
+        checkpoint({**(resume or dict(phase="prepared", segments=[], processed_sec=0)), "interrupted": False, "paused": False})
+        pause()
         preview_path = job_dir / "audio.m4a"
         preview = str(preview_path) if preview_path.exists() else audio.make_preview_audio(path or wav, str(preview_path))
+        pause()
         if resume and resume["phase"] == "postprocess":
             # 旧形式には認識統計がないため、分かる範囲だけ復元する。
             result = {**dict(model=opts["model"], speed=opts["speed"], decoding=opts["decoding"],
@@ -179,11 +182,15 @@ def _run_transcription(job_dir, path, opts, settings, sub, resume=None):
                 asr_wav, model_name=opts["model"], language=opts["language"], **hints,
                 duration=duration, speed=opts["speed"], decoding=opts["decoding"], silence_guard=opts["silence_guard"],
                 progress_cb=lambda f, desc=None: sub(0.05 + 0.75 * f, desc or f"文字起こし中... {int(f * 100)}%"),
-                checkpoint_cb=checkpoint, resume=resume,
+                checkpoint_cb=checkpoint, resume=resume, pause_cb=pause,
             )
         checkpoint({"phase": "postprocess", "segments": copy.deepcopy(result["segments"]),
                     "processed_sec": duration, "asr_result": {k: v for k, v in result.items() if k != "segments"}})
-        job = _finish_transcription(job_dir, name, wav, preview, duration, result, opts, settings, people_list, sub)
+        job = _finish_transcription(job_dir, name, wav, preview, duration, result, opts, settings, people_list, sub, pause)
+    except run_control.PauseRequested:
+        checkpoint.pause()
+        sub(1.0, "途中保存を完了し、一時停止しました")
+        return checkpoints.as_job(job_dir, output.load_json(job_dir, checkpoints.FILENAME))
     except Exception:
         if checkpoint is not None:
             try:
@@ -202,8 +209,11 @@ def _run_transcription(job_dir, path, opts, settings, sub, resume=None):
     return job
 
 
-def _finish_transcription(job_dir, name, wav, preview, duration, result, opts, settings, people_list, sub):
+def _finish_transcription(job_dir, name, wav, preview, duration, result, opts, settings, people_list, sub,
+                          pause=lambda: None):
+    pause()
     punctuate.punctuate_segments(result["segments"])  # 「、」「。」を推定して補う
+    pause()
 
     word_speakers, cluster_embeddings, matched = {}, {}, {}
     if opts["diarize"] and diarization.available():
@@ -215,6 +225,7 @@ def _finish_transcription(job_dir, name, wav, preview, duration, result, opts, s
             max_speakers=int(dia.get("max_speakers", 12)), hf_token=dia.get("hf_token", ""),
             match_similarity=float(dia.get("match_similarity", 0.55)),
         )
+    pause()
 
     threshold = settings.get("postprocess", {}).get("red_threshold", 0.5)
     utts = U.build_utterances(result["segments"], word_speakers, threshold)
@@ -222,6 +233,7 @@ def _finish_transcription(job_dir, name, wav, preview, duration, result, opts, s
     if opts.get("fillers", True):
         utts, fillers = U.remove_fillers(utts, threshold)
     _finalize_text(utts, people_list)
+    pause()
 
     # 声紋DBとはっきり一致した人は、この会議の声もすぐ学習する（あいまいな一致は、
     # ②で確かめてから「③ 議事録を作る」の時に学習する）
@@ -274,6 +286,7 @@ def _finish_transcription(job_dir, name, wav, preview, duration, result, opts, s
             "elapsed_sec": round(result.get("elapsed", 0), 1),
         },
     }
+    pause()
     _save_job(job)
     sub(1.0, "文字起こし完了")
     return job
@@ -283,7 +296,7 @@ def _finish_transcription(job_dir, name, wav, preview, duration, result, opts, s
 # core.worker から別プロセスで呼ぶ入口（progress(割合, 説明) で進み具合を返す）
 # =====================================================================
 
-def transcribe_files(paths: list[str], opts: dict, settings: dict, progress=None) -> list[dict]:
+def transcribe_files(paths: list[str], opts: dict, settings: dict, progress=None, pause_file=None) -> list[dict]:
     """①の本体。ファイルごとに {"job": 結果} か {"error": メッセージ} を返す。
     Whisperのモデルは1回だけ読み込んで全ファイルで使い回す。"""
     import traceback
@@ -291,13 +304,20 @@ def transcribe_files(paths: list[str], opts: dict, settings: dict, progress=None
     n = len(paths)
     results = []
     for i, path in enumerate(paths):
+        if run_control.requested(pause_file):
+            results.append({"paused": None, "remaining": [Path(p).name for p in paths[i:]]})
+            break
         name = Path(path).name
 
         def sub(frac, desc, i=i, name=name):
             progress((i + frac) / n, f"[{i + 1}/{n}] {name}: {desc}")
 
         try:
-            results.append({"job": _transcribe_one(path, opts, settings, sub)})
+            job = _transcribe_one(path, opts, settings, sub, pause_file)
+            if job.get("incomplete"):
+                results.append({"paused": job, "remaining": [Path(p).name for p in paths[i + 1:]]})
+                break
+            results.append({"job": job})
         except Exception as e:
             logging.error(traceback.format_exc())
             results.append({"error": f"{name}: {e}（保存済みの途中結果は「過去の結果を開く」で確認できます）"})

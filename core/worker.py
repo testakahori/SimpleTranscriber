@@ -25,15 +25,18 @@ class WorkerError(RuntimeError):
     pass
 
 
-def run(target: str, *args, progress=None):
+def run(target: str, *args, progress=None, pause_file=None):
     """target ("モジュール:関数") を別プロセスで実行して戻り値を返す。
     関数は progress=コールバック を受け取る。例外は WorkerError として親に伝える。"""
     with tempfile.TemporaryDirectory(prefix="st_worker_") as tmp:
         arg_path, out_path = Path(tmp) / "args.pkl", Path(tmp) / "result.pkl"
         arg_path.write_bytes(pickle.dumps(args))
         env = dict(os.environ, PYTHONIOENCODING="utf-8", KMP_DUPLICATE_LIB_OK="TRUE")
+        command = [sys.executable, "-m", "core.worker", target, str(arg_path), str(out_path)]
+        if pause_file:
+            command.append(pause_file)
         proc = subprocess.Popen(
-            [sys.executable, "-m", "core.worker", target, str(arg_path), str(out_path)],
+            command,
             cwd=str(ROOT), env=env, stdout=subprocess.PIPE, text=True, encoding="utf-8",
             errors="replace")
         try:
@@ -50,6 +53,7 @@ def run(target: str, *args, progress=None):
             code = proc.wait()
         except BaseException:  # 画面側で中断された時に子を残さない
             proc.kill()
+            proc.wait()
             raise
         if not out_path.exists():
             raise WorkerError(f"作業用プロセスが異常終了しました（終了コード {code}）。"
@@ -60,7 +64,7 @@ def run(target: str, *args, progress=None):
         return value
 
 
-def _main(target: str, arg_path: str, out_path: str) -> None:
+def _main(target: str, arg_path: str, out_path: str, pause_file: str | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - [worker] %(message)s")
     try:
         import truststore
@@ -76,7 +80,10 @@ def _main(target: str, arg_path: str, out_path: str) -> None:
         mod, fn = target.split(":")
         func = getattr(importlib.import_module(mod), fn)
         args = pickle.loads(Path(arg_path).read_bytes())
-        data = pickle.dumps(("ok", func(*args, progress=progress)))
+        kwargs = {"progress": progress}
+        if pause_file:
+            kwargs["pause_file"] = pause_file
+        data = pickle.dumps(("ok", func(*args, **kwargs)))
     except Exception as e:
         logging.exception(f"{target} に失敗しました")
         data = pickle.dumps(("error", f"{type(e).__name__}: {e}"))
@@ -84,4 +91,4 @@ def _main(target: str, arg_path: str, out_path: str) -> None:
 
 
 if __name__ == "__main__":
-    _main(*sys.argv[1:4])
+    _main(*sys.argv[1:5])

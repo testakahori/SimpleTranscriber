@@ -72,7 +72,7 @@ def keep_audio(job_dir: Path, wav: str, asr_wav: str) -> dict:
                 shutil.copyfileobj(src, dst, length=1024 * 1024)
                 dst.flush()
                 os.fsync(dst.fileno())
-            os.replace(tmp, job_dir / name)
+            output.retry_file_operation(lambda: os.replace(tmp, job_dir / name))
         finally:
             tmp.unlink(missing_ok=True)
         records[key] = {"filename": name, "sha256": file_hash(job_dir / name)}
@@ -136,7 +136,8 @@ def notice(job: dict) -> str:
     phase = PHASES.get(cp.get("phase"), "音声認識")
     return (f"⚠️ **途中保存・全編未完了** — {phase} / 処理位置 {position} / 音声全体 {total}"
             f" / 保存日時 {cp.get('saved_at', '不明')}。処理位置は認識できた発言の量ではありません。\n\n"
-            + ("処理エラーで終了しました。\n\n" if cp.get("interrupted") else "")
+            + ("⏸ 保存して一時停止しました。「▶ 途中保存から再開」で続行できます。\n\n"
+               if cp.get("paused") else "処理エラーで終了しました。\n\n" if cp.get("interrupted") else "")
             + ("この旧形式の保存には音声・設定がありません。同じ元音声を1件だけ選び、"
                "画面の認識設定を当時の値に合わせてから再開してください（同名・同じ長さを確認しますが、"
                "元音声との完全一致は検証できません）。\n\n" if not job.get("resumable_audio") else "")
@@ -150,7 +151,7 @@ def as_job(job_dir: Path, data: dict) -> dict:
         "meeting_date": data.get("meeting_date", ""), "memo": data.get("memo", ""),
         "meta_line": "途中保存・全編未完了（話者未確定）", "incomplete": True,
         "resumable_audio": bool(data.get("resume_audio")),
-        "checkpoint": {k: data.get(k) for k in ("phase", "processed_sec", "saved_at", "interrupted")},
+        "checkpoint": {k: data.get(k) for k in ("phase", "processed_sec", "saved_at", "interrupted", "paused")},
         "utterances": U.build_utterances(data.get("segments", []), None),
         "cluster_embeddings": {}, "audio_path": str(preview) if preview.exists() else None,
     }
@@ -187,5 +188,10 @@ class Writer:
 
     def interrupted(self):
         if self.latest is not None:
-            self.latest = {**self.latest, "interrupted": True}
+            self.latest = {**self.latest, "interrupted": True, "paused": False}
             self._save()
+
+    def pause(self):
+        # 10秒間隔の制限を使わず、受け取った最新の本文・進捗を確実に保存してから返す。
+        self.latest = {**self.latest, "paused": True, "interrupted": False}
+        self._save()
