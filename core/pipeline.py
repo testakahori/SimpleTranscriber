@@ -7,7 +7,7 @@ import logging
 import re
 from pathlib import Path
 
-from . import audio, config, diarization, glossary, output, people, punctuate, transcriber
+from . import audio, checkpoints, config, diarization, glossary, output, people, punctuate, transcriber
 from . import utterances as U
 
 
@@ -22,6 +22,8 @@ def _meeting_date_from_name(name: str) -> str:
 
 def _save_job(job: dict) -> None:
     """発言データから transcript.md / srt / vtt / utterances.json を書き出す"""
+    if job.get("incomplete"):
+        raise ValueError(checkpoints.READ_ONLY_NOTICE)
     job_dir = Path(job["job_dir"])
     utts = job["utterances"]
     settings = config.load_settings()
@@ -33,6 +35,9 @@ def _save_job(job: dict) -> None:
     cues = U.build_cues(utts, sub)
     output.write_text(job_dir, "transcript.srt", U.cues_to_srt(cues, sub.get("speaker_prefix", False)))
     output.write_text(job_dir, "transcript.vtt", U.cues_to_vtt(cues, sub.get("speaker_prefix", False)))
+    if job.get("cluster_embeddings"):
+        output.save_json(job_dir, "speaker_clusters.json", job["cluster_embeddings"])
+    # 完成データは最後に公開する。途中で失敗した場合、履歴はcheckpoint.jsonを開く。
     output.save_json(job_dir, "utterances.json", {
         "source": job["source"],
         "duration": job.get("duration", 0.0),
@@ -41,8 +46,6 @@ def _save_job(job: dict) -> None:
         "memo": job.get("memo", ""),
         "utterances": utts,
     })
-    if job.get("cluster_embeddings"):
-        output.save_json(job_dir, "speaker_clusters.json", job["cluster_embeddings"])
 
 
 def _plain_md(job: dict) -> str:
@@ -92,8 +95,12 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
     sub(0.01, "音声を変換中...")
     wav = audio.prepare_audio(path)
     asr_wav = wav
+    checkpoint = None
     try:
         duration = audio.get_duration(wav)
+        checkpoint = checkpoints.Writer(job_dir, name, duration,
+                                         opts.get("meeting_date") or _meeting_date_from_name(name),
+                                         opts.get("memo", ""))
         preview = audio.make_preview_audio(path, str(job_dir / "audio.m4a"))
         if opts["noise"]:
             sub(0.03, "文字起こし用に音声を補正中（ノイズ除去）...")
@@ -110,7 +117,9 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
             decoding=opts.get("decoding", settings.get("whisper", {}).get("decoding", "stable")),
             silence_guard=opts.get("silence_guard", settings.get("whisper", {}).get("silence_guard", True)),
             progress_cb=lambda f, desc=None: sub(0.05 + 0.75 * f, desc or f"文字起こし中... {int(f * 100)}%"),
+            checkpoint_cb=checkpoint,
         )
+        checkpoint({"phase": "postprocess", "segments": result["segments"], "processed_sec": duration})
         punctuate.punctuate_segments(result["segments"])  # 「、」「。」を推定して補う
 
         word_speakers, cluster_embeddings, matched = {}, {}, {}
@@ -146,6 +155,13 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
                 diarization.learn_from_utterances(wav, utts, _voice_tag(job_dir), only=sure)
             except Exception as e:
                 logging.warning(f"声紋の学習に失敗: {e}")
+    except Exception:
+        if checkpoint is not None:
+            try:
+                checkpoint.interrupted()
+            except Exception:
+                logging.exception("途中結果の最終保存に失敗しました。前回の保存は保持します")
+        raise
     finally:
         Path(wav).unlink(missing_ok=True)
         if asr_wav != wav:
@@ -211,7 +227,7 @@ def transcribe_files(paths: list[str], opts: dict, settings: dict, progress=None
             results.append({"job": _transcribe_one(path, opts, settings, sub)})
         except Exception as e:
             logging.error(traceback.format_exc())
-            results.append({"error": f"{name}: {e}"})
+            results.append({"error": f"{name}: {e}（保存済みの途中結果は「過去の結果を開く」で確認できます）"})
     return results
 
 
