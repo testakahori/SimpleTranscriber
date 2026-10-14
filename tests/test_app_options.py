@@ -31,6 +31,10 @@ class SilenceGuardUITest(unittest.TestCase):
             try:
                 start = next(fn for fn in demo.fns.values() if fn.fn is app.run_batch)
                 resume = next(fn for fn in demo.fns.values() if fn.fn is app.resume_transcription)
+                pause = next(fn for fn in demo.fns.values() if fn.fn is app.pause_transcription)
+                self.assertFalse(pause.queue)  # 認識の完了待ちの列に停止操作を並べない。
+                self.assertEqual(pause.inputs, [])  # Gradioが画面のsession_hashを注入する。
+                self.assertEqual(pause.outputs[0].elem_id, "st-pause-status")
                 self.assertEqual(resume.inputs[1:], start.inputs)
                 self.assertEqual(resume.outputs, start.outputs)
                 self.assertEqual(resume.concurrency_id, start.concurrency_id)

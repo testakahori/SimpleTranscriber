@@ -1,9 +1,11 @@
 """output/ フォルダへの構造化出力"""
 import datetime
 import json
+import logging
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 
 from .config import OUTPUT_DIR
@@ -29,6 +31,17 @@ def create_job_dir(source_filename: str) -> Path:
     return job_dir
 
 
+def retry_file_operation(action):
+    """Windowsで一時的にファイルを開かれている場合だけ短く待つ。容量不足等は即時通知。"""
+    for attempt in range(6):
+        try:
+            return action()
+        except OSError as e:
+            if getattr(e, "winerror", None) not in (32, 33) or attempt == 5:
+                raise
+            time.sleep(0.05 * 2 ** attempt)
+
+
 def write_text(job_dir: Path, filename: str, content: str) -> Path:
     """同じフォルダの一時ファイルから置換し、書き込み失敗時は前回の保存を残す。"""
     path = Path(job_dir) / filename
@@ -41,10 +54,13 @@ def write_text(job_dir: Path, filename: str, content: str) -> Path:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temp, path)
+        retry_file_operation(lambda: os.replace(temp, path))
     finally:
         if temp is not None:
-            temp.unlink(missing_ok=True)
+            try:
+                retry_file_operation(lambda: temp.unlink(missing_ok=True))
+            except OSError:
+                logging.warning("保存用の一時ファイルを削除できませんでした: %s", temp, exc_info=True)
     return path
 
 

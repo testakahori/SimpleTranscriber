@@ -26,7 +26,7 @@ from core import audio, checkpoints, config, diarization, document_status, gloss
 from core import export as export_mod
 from core import search as search_mod
 from core import utterances as U
-from core import worker
+from core import run_control, worker
 from core.pipeline import _finalize_text, _plain_md, _save_job, _voice_tag
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
@@ -231,8 +231,28 @@ def _recognition_options(model_name, speed, language, num_speakers, noise, eq_on
     }
 
 
+def pause_transcription(request: gr.Request):
+    if run_control.request_pause(request.session_hash):
+        return ("⏳ 一時停止を受け付けました。処理中の区間を終え、最新の途中結果を保存して止めます。"
+                "音声準備・モデル読み込み・話者識別中は、その処理が戻るまでお待ちください。")
+    return "この画面で実行中の文字起こしはありません。実行待ちの場合は処理開始後に押してください。"
+
+
+def _run_asr(target, *args, settings, progress, request):
+    with run_control.session(request.session_hash if request else None) as pause_file:
+        # 前回のLLMがメモリに残っているとWhisperを読み込めないため、先に解放する。
+        llm.unload_ollama(settings)
+        return worker.run(target, *args, progress=progress, pause_file=pause_file)
+
+
+def _paused_message(job):
+    return (f"⏸ **{job['source']}** の途中結果と再開用音声を保存して一時停止しました。"
+            "「▶ 途中保存から再開」で続行できます。アプリを閉じた場合も、履歴から開いて再開できます。")
+
+
 def resume_transcription(state, files, model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on,
-                         meeting_date, memo, decoding="stable", silence_guard=True, progress=gr.Progress()):
+                         meeting_date, memo, decoding="stable", silence_guard=True, progress=gr.Progress(),
+                         request: gr.Request = None):
     if not state or not state.get("incomplete"):
         return ("⚠️ 履歴から「途中保存」の結果を開いてください。", gr.update()) + \
             tuple(gr.update() for _ in range(VIEW_COUNT)) + (refresh_history(),)
@@ -242,13 +262,15 @@ def resume_transcription(state, files, model_name, speed, language, num_speakers
     paths = [f if isinstance(f, str) else f.name for f in files or []]
     job_name = Path(state["job_dir"]).name
     try:
-        llm.unload_ollama(settings)
         progress(0, desc="途中保存を確認中...")
-        job = worker.run("core.pipeline:resume_job", state["job_dir"], paths, opts, settings,
-                         progress=lambda f, d: progress(f, desc=d))
-        _write_meta(job, job["run_options"], settings)
-        message = (f"✅ **{job['source']}** の続きを処理し、同じ保存先に完成版を保存しました。"
-                   "次は ② 確認・修正で本文と話者名を確認してください。")
+        job = _run_asr("core.pipeline:resume_job", state["job_dir"], paths, opts, settings,
+                       settings=settings, progress=lambda f, d: progress(f, desc=d), request=request)
+        if job.get("incomplete"):
+            message = _paused_message(job)
+        else:
+            _write_meta(job, job["run_options"], settings)
+            message = (f"✅ **{job['source']}** の続きを処理し、同じ保存先に完成版を保存しました。"
+                       "次は ② 確認・修正で本文と話者名を確認してください。")
     except Exception as e:
         logging.error(traceback.format_exc())
         message = f"⚠️ 再開処理を完了できませんでした: {e}。保存済みの結果は保持しています。"
@@ -258,7 +280,8 @@ def resume_transcription(state, files, model_name, speed, language, num_speakers
 
 
 def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on,
-              meeting_date, memo, decoding="stable", silence_guard=True, progress=gr.Progress()):
+              meeting_date, memo, decoding="stable", silence_guard=True, progress=gr.Progress(),
+              request: gr.Request = None):
     """① 音声 → 文字起こし（話者識別まで）。AIの校正・議事録は②③で別に行う"""
     if not files:
         return ("⚠️ ファイルを選択してください。", gr.update()) + \
@@ -269,21 +292,21 @@ def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fi
     paths = [f if isinstance(f, str) else f.name for f in files]
     n = len(paths)
 
-    # 前回のLLM(gemma4:31b)がメモリに残っているとWhisperが読み込めないため先に解放
-    llm.unload_ollama(settings)
-
     # Whisper・話者分離は別プロセスで動かす（終わるとVRAMが全部空き、③のLLMが遅くならない）
     jobs, failures = [], []
+    paused_job, paused_batch, remaining = None, False, []
     progress(0.0, desc="文字起こしの準備中（モデルを読み込んでいます）...")
     try:
-        results = worker.run("core.pipeline:transcribe_files", paths, opts, settings,
-                             progress=lambda f, d: progress(f, desc=d))
+        results = _run_asr("core.pipeline:transcribe_files", paths, opts, settings,
+                           settings=settings, progress=lambda f, d: progress(f, desc=d), request=request)
     except Exception as e:
         logging.error(traceback.format_exc())
         results = [{"error": str(e)}]
     for r in results:
         if "job" in r:
             jobs.append(r["job"])
+        elif "paused" in r:
+            paused_batch, paused_job, remaining = True, r["paused"], r["remaining"]
         else:
             failures.append(f"❌ {r['error']}")
 
@@ -314,18 +337,22 @@ def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fi
         for err in job["errors"]:
             lines.append(f"　⚠️ {err}")
     lines.extend(failures)
+    if paused_batch:
+        lines.append(_paused_message(paused_job) if paused_job else "⏸ 次のファイルを始める前に一括処理を停止しました。")
+        if remaining:
+            lines.append("未着手のファイルは、あとで選び直して開始してください: " + "、".join(remaining))
     if failures:
         lines.append("認識済みの途中保存がある場合は「📂 過去の結果を開く」から確認できます。"
                      "アプリを再起動しても残ります。")
-    if jobs:
+    if jobs and not paused_batch:
         lines.append("**次は ② 確認・修正**: 右の文字起こしを見て、話者名と内容を直してください"
                      "（「✍️ AI校正」で誤変換をAIに直させることもできます）。"
                      "直し終わったら「③ 📋 議事録を作る」。")
     summary = "\n\n".join(lines)
 
-    if not jobs:
+    if not jobs and not paused_job:
         return (summary, gr.update()) + tuple(gr.update() for _ in range(VIEW_COUNT)) + (refresh_history(),)
-    last = jobs[-1]
+    last = paused_job or jobs[-1]
     views = _job_views(last)
     state = {k: v for k, v in last.items() if k not in ("errors", "matched", "stats")}
     jobs_list = output.list_editable_jobs()
@@ -1065,7 +1092,10 @@ def build_ui():
                                 value=dia_available, interactive=dia_available,
                                 label="話者識別・声紋照合" + ("" if dia_available else "（未導入）"))
                         start_btn = gr.Button("① 🚀 文字起こし開始", variant="primary", size="lg")
+                        pause_btn = gr.Button("⏸ 一時停止（保存して止める）", size="sm")
+                        pause_status = gr.Markdown(elem_id="st-pause-status")
                         gr.Markdown("<small>①は音声の文字起こしと話者識別だけを行います。"
+                                    "一時停止は処理中の区間が終わってから保存して止めます。"
                                     "認識中は途中保存し、停止した場合は履歴から開いて続きを再開できます。"
                                     "AI校正（②）と議事録（③）は、確認・修正のあと右側のボタンで別に実行します。</small>")
                         result_md = gr.Markdown(elem_id="st-summary")
@@ -1330,20 +1360,23 @@ def build_ui():
         noise_apply_btn.click(fn=apply_noise_sample, inputs=[noise_source, noise_start, noise_end, noise_strength],
                               outputs=[noise_status, noise_reduced, noise_removed, noise_download])
 
+        pause_btn.click(fn=pause_transcription, outputs=pause_status, queue=False)
         start_btn.click(
             fn=run_batch,
             inputs=[files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, eq_cb, fillers_cb, diarize_cb,
                     meeting_date_box, memo_box, decoding_radio, silence_guard_cb],
             outputs=[result_md, job_state] + view_outputs + [history_dd],
             concurrency_id="asr",
-        ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
+        ).then(fn=lambda: "", outputs=pause_status, queue=False
+               ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
 
         resume_btn.click(
             fn=resume_transcription,
             inputs=[job_state, files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, eq_cb,
                     fillers_cb, diarize_cb, meeting_date_box, memo_box, decoding_radio, silence_guard_cb],
             outputs=[result_md, job_state] + view_outputs + [history_dd], concurrency_id="asr",
-        ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
+        ).then(fn=lambda: "", outputs=pause_status, queue=False
+               ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
 
         speed_radio.change(fn=lambda speed: gr.update(interactive=speed != "fast"),
                            inputs=speed_radio, outputs=silence_guard_cb, queue=False)
