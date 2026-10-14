@@ -22,7 +22,7 @@ from pathlib import Path
 import gradio as gr
 import httpx
 
-from core import audio, config, diarization, glossary, llm, minutes, noise_profile, output, people, transcriber
+from core import audio, checkpoints, config, diarization, document_status, glossary, llm, minutes, noise_profile, output, people, transcriber
 from core import export as export_mod
 from core import search as search_mod
 from core import utterances as U
@@ -35,6 +35,7 @@ config.ensure_dirs()
 
 FILE_TYPES = [f".{e.lstrip('.')}" for e in audio.SUPPORTED_EXTS]
 SPEAKER_COUNT_CHOICES = [("自動", 0)] + [(f"{n}人", n) for n in range(1, 11)]
+VIEW_COUNT = 9
 
 
 def preview_noise_sample(source, start, end):
@@ -108,7 +109,8 @@ def _load_job(job_name: str) -> dict | None:
     job_dir = output.job_path(job_name)
     data = output.load_json(job_dir, "utterances.json")
     if not data:
-        return None
+        partial = output.load_json(job_dir, checkpoints.FILENAME)
+        return checkpoints.as_job(job_dir, partial) if partial else None
     preview = job_dir / "audio.m4a"
     return {
         "job_dir": str(job_dir),
@@ -125,7 +127,10 @@ def _load_job(job_name: str) -> dict | None:
 
 def _read_md(job: dict, name: str) -> str:
     path = Path(job["job_dir"]) / name
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+    if not path.exists():
+        return ""
+    warning = document_status.warning(job, name)
+    return (warning + "\n\n---\n\n" if warning else "") + path.read_text(encoding="utf-8")
 
 
 
@@ -135,6 +140,10 @@ def _read_md(job: dict, name: str) -> str:
 def _download_transcript(job: dict):
     """タグなしの文字起こし.md を渡す（以前のジョブで未作成なら今作る）"""
     job_dir = Path(job["job_dir"])
+    if job.get("incomplete"):
+        # ワーカーが更新する途中本文は上書きせず、表示中の時点の内容を渡す。
+        output.write_text(job_dir, checkpoints.SNAPSHOT_TRANSCRIPT, checkpoints.markdown(job))
+        return _download(job, checkpoints.SNAPSHOT_TRANSCRIPT)
     if not (job_dir / "文字起こし.md").exists() and job["utterances"]:
         output.write_text(job_dir, "文字起こし.md", _plain_md(job))
     return _download(job, "文字起こし.md")
@@ -142,9 +151,11 @@ def _download_transcript(job: dict):
 
 def _download(job: dict, name: str):
     path = Path(job["job_dir"]) / name
-    if path.exists():
-        return gr.update(value=str(path), interactive=True)
-    return gr.update(value=None, interactive=False)
+    label = "字幕.srt" if name == "transcript.srt" else name
+    state = document_status.status(job, name)
+    prefix = {"stale": "⚠️ 更新前: ", "unknown": "⚠️ 更新状況不明: "}.get(state, "📥 ")
+    available = path.exists() and (not job.get("incomplete") or name == checkpoints.SNAPSHOT_TRANSCRIPT)
+    return gr.update(label=prefix + label, value=str(path) if available else None, interactive=available)
 
 
 def _speaker_rows(job: dict) -> list[list]:
@@ -177,8 +188,10 @@ def _job_views(job: dict):
         _download_transcript(job),
         _download(job, "議事録.md"),
         _download(job, "transcript.srt"),
-        _speaker_rows(job),
-        _edit_rows(job),
+        gr.update(value=_speaker_rows(job), interactive=not job.get("incomplete", False)),
+        gr.update(value=_edit_rows(job), interactive=not job.get("incomplete", False)),
+        "\n\n".join(filter(None, [checkpoints.notice(job)] +
+                            [document_status.warning(job, name) for name in document_status.DOCUMENTS])),
     )
 
 
@@ -213,7 +226,7 @@ def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fi
     """① 音声 → 文字起こし（話者識別まで）。AIの校正・議事録は②③で別に行う"""
     if not files:
         return ("⚠️ ファイルを選択してください。", gr.update()) + \
-            tuple(gr.update() for _ in range(8)) + (gr.update(),)
+            tuple(gr.update() for _ in range(VIEW_COUNT)) + (gr.update(),)
 
     settings = config.load_settings()
     opts = {
@@ -270,6 +283,9 @@ def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fi
         for err in job["errors"]:
             lines.append(f"　⚠️ {err}")
     lines.extend(failures)
+    if failures:
+        lines.append("認識済みの途中保存がある場合は「📂 過去の結果を開く」から確認できます。"
+                     "アプリを再起動しても残ります。")
     if jobs:
         lines.append("**次は ② 確認・修正**: 右の文字起こしを見て、話者名と内容を直してください"
                      "（「✍️ AI校正」で誤変換をAIに直させることもできます）。"
@@ -277,7 +293,7 @@ def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fi
     summary = "\n\n".join(lines)
 
     if not jobs:
-        return (summary, gr.update()) + tuple(gr.update() for _ in range(8)) + (gr.update(),)
+        return (summary, gr.update()) + tuple(gr.update() for _ in range(VIEW_COUNT)) + (refresh_history(),)
     last = jobs[-1]
     views = _job_views(last)
     state = {k: v for k, v in last.items() if k not in ("errors", "matched", "stats")}
@@ -290,15 +306,17 @@ def open_job(job_name):
     job = _load_job(job_name) if job_name else None
     if not job:
         return ("⚠️ 開けませんでした（古い形式の出力には対応していません）", gr.update()) + \
-            tuple(gr.update() for _ in range(8))
+            tuple(gr.update() for _ in range(VIEW_COUNT))
     return (f"📂 `{job_name}` を開きました", job) + _job_views(job)
 
 
 def rediarize_job(state, num_speakers, progress=gr.Progress()):
     """保存済みの文字起こし（単語タイミング）と再生用音声を使って、話者識別だけやり直す"""
-    none = tuple(gr.update() for _ in range(8))
+    none = tuple(gr.update() for _ in range(VIEW_COUNT))
     if not state:
         return ("⚠️ 先に文字起こしを実行するか、過去の結果を開いてください。", gr.update()) + none
+    if state.get("incomplete"):
+        return (checkpoints.READ_ONLY_NOTICE, state) + none
     if not diarization.available():
         return ("❌ 話者分離ライブラリが未導入です。", gr.update()) + none
     if not state.get("audio_path") or not Path(state["audio_path"]).exists():
@@ -336,9 +354,11 @@ def rediarize_job(state, num_speakers, progress=gr.Progress()):
 
 def reflow_job(state):
     """保存済みの結果を、今の句読点・話者まとめ規則で組み直す（GPU不要ですぐ終わる）"""
-    none = tuple(gr.update() for _ in range(8))
+    none = tuple(gr.update() for _ in range(VIEW_COUNT))
     if not state:
         return ("⚠️ 先に文字起こしを実行するか、過去の結果を開いてください。", gr.update()) + none
+    if state.get("incomplete"):
+        return (checkpoints.READ_ONLY_NOTICE, state) + none
     job = state
     people_list = people.load_people()
     edited = U.count_edited(job["utterances"], lambda t: U.fix_ichi(
@@ -384,6 +404,8 @@ def _llm_ready(state):
     """②③の共通チェック。問題があればメッセージを返す"""
     if not state:
         return "⚠️ 先に文字起こしを実行するか、過去の結果を開いてください。"
+    if state.get("incomplete"):
+        return checkpoints.READ_ONLY_NOTICE
     # Whisper・声紋モデルをVRAMから降ろして、LLM(gemma4)にGPUを譲る
     transcriber.unload()
     diarization.unload()
@@ -401,7 +423,7 @@ def _eta(started: float, frac: float) -> str:
 
 def proofread_job(state, redo, progress=gr.Progress()):
     """② AI校正。校正済み・手修正済みの発言は飛ばすので、途中で止まっても続きから再開できる"""
-    none = tuple(gr.update() for _ in range(8))
+    none = tuple(gr.update() for _ in range(VIEW_COUNT))
     err = _llm_ready(state)
     if err:
         return (err, gr.update()) + none
@@ -442,7 +464,9 @@ def proofread_job(state, redo, progress=gr.Progress()):
 
 
 def _make_doc(state, kind: str, progress):
-    none = tuple(gr.update() for _ in range(8))
+    none = tuple(gr.update() for _ in range(VIEW_COUNT))
+    if state and state.get("incomplete"):
+        return (checkpoints.READ_ONLY_NOTICE, state) + none
     learned = ""
     if state and kind == "minutes" and config.load_settings()["diarization"].get("auto_learn", True):
         # ②で直した後の話者で学習する（LLMにGPUを譲る前に済ませる）
@@ -453,17 +477,15 @@ def _make_doc(state, kind: str, progress):
         return (err, gr.update()) + none
     job = state
     settings = config.load_settings()
-    transcript = minutes.transcript_for_llm(job["utterances"])
-    if job.get("memo"):
-        transcript = f"（会議メモ: {job['memo']}）\n\n" + transcript
+    source = document_status.inputs(job)
     label, filename, fn = (("議事録", "議事録.md", minutes.generate_minutes) if kind == "minutes"
                            else ("要約と考察", "要約と考察.md", minutes.generate_insights))
     progress(0.1, desc=f"{label}を作成中...（長い会議は区間ごとのメモを作ってからまとめます）")
     try:
-        md = fn(settings, transcript, job["source"], job.get("meeting_date", ""))
-        output.write_text(Path(job["job_dir"]), filename, md)
+        md = fn(settings, source["transcript"], source["source"], source["meeting_date"])
+        document_status.save(Path(job["job_dir"]), filename, md, source)
         msg = f"✅ {label}を作りました（上の「{label}」タブで確認・📥 からダウンロード）"
-    except llm.LLMError as e:
+    except (llm.LLMError, OSError) as e:
         msg = f"⚠️ {label}を作れませんでした: {e}"
     notice = llm.pop_fallback_notice()
     if notice:
@@ -488,7 +510,9 @@ def make_insights(state, progress=gr.Progress()):
 
 def assign_speakers(rows, save_voice, state):
     if not state:
-        return ("⚠️ 先に文字起こしを実行してください。", state) + tuple(gr.update() for _ in range(8))
+        return ("⚠️ 先に文字起こしを実行してください。", state) + tuple(gr.update() for _ in range(VIEW_COUNT))
+    if state.get("incomplete"):
+        return (checkpoints.READ_ONLY_NOTICE, state) + tuple(gr.update() for _ in range(VIEW_COUNT))
     job = state
     embeddings = job.get("cluster_embeddings", {}) or {}
     people_list = people.load_people()
@@ -499,10 +523,10 @@ def assign_speakers(rows, save_voice, state):
         if label and new_name and label != new_name:
             err = diarization.validate_name(new_name)
             if err:
-                return (f"⚠️ {new_name}: {err}", state) + tuple(gr.update() for _ in range(8))
+                return (f"⚠️ {new_name}: {err}", state) + tuple(gr.update() for _ in range(VIEW_COUNT))
             mapping[label] = new_name
     if not mapping:
-        return ("⚠️ 「名前」列に入力してください。", state) + tuple(gr.update() for _ in range(8))
+        return ("⚠️ 「名前」列に入力してください。", state) + tuple(gr.update() for _ in range(VIEW_COUNT))
 
     # 一括で置き換える（入れ替え A⇔B や連鎖 A→B→C でも話者が混ざらない）
     for u in job["utterances"]:
@@ -536,7 +560,9 @@ def assign_speakers(rows, save_voice, state):
 
 def save_utterance_edits(rows, state):
     if not state:
-        return ("⚠️ 先に文字起こしを実行してください。", state) + tuple(gr.update() for _ in range(8))
+        return ("⚠️ 先に文字起こしを実行してください。", state) + tuple(gr.update() for _ in range(VIEW_COUNT))
+    if state.get("incomplete"):
+        return (checkpoints.READ_ONLY_NOTICE, state) + tuple(gr.update() for _ in range(VIEW_COUNT))
     job = state
     utts = job["utterances"]
     shown = job.get("_shown") or [[u.get("speaker", ""), u["text"]] for u in utts]
@@ -614,6 +640,8 @@ def _warn_md(cues, opts, extra=None) -> str:
 def srt_regenerate(state, *sub_args):
     if not state:
         return gr.update(), "⚠️ 先に文字起こしを実行するか、過去の結果を開いてください。"
+    if state.get("incomplete"):
+        return gr.update(), checkpoints.READ_ONLY_NOTICE
     opts = _sub_opts(*sub_args)
     settings = config.load_settings()
     settings["subtitle"] = opts
@@ -678,6 +706,8 @@ def srt_apply_learned(rows, *sub_args):
 
 
 def srt_save(rows, state, *sub_args):
+    if state and state.get("incomplete"):
+        return None, checkpoints.READ_ONLY_NOTICE
     opts = _sub_opts(*sub_args)
     cues, errors = _rows_to_cues(rows)
     if not cues:
@@ -699,6 +729,8 @@ def srt_save(rows, state, *sub_args):
 def load_srt_for_state(state):
     if not state:
         return gr.update()
+    if state.get("incomplete"):
+        return _cue_rows([])
     settings = config.load_settings()
     return _cue_rows(U.build_cues(state["utterances"], settings.get("subtitle", {})))
 
@@ -829,6 +861,11 @@ def do_export(job_name, md_name, to_docx, to_pdf):
     msg = "✅ 出力しました: " + ", ".join(Path(g).name for g in generated) if generated else ""
     if errors:
         msg += ("\n" if msg else "") + "\n".join(f"❌ {e}" for e in errors)
+    job = _load_job(job_name)
+    if job:
+        warning = document_status.warning(job, md_name)
+        if warning:
+            msg = warning + "\n\n" + msg
     return msg, generated or None
 
 
@@ -998,6 +1035,7 @@ def build_ui():
                                 label="話者識別・声紋照合" + ("" if dia_available else "（未導入）"))
                         start_btn = gr.Button("① 🚀 文字起こし開始", variant="primary", size="lg")
                         gr.Markdown("<small>①は音声の文字起こしと話者識別だけを行います。"
+                                    "認識中は途中保存し、停止した場合は履歴から開けます（続きからの再開は未対応）。"
                                     "AI校正（②）と議事録（③）は、確認・修正のあと右側のボタンで別に実行します。</small>")
                         result_md = gr.Markdown(elem_id="st-summary")
                         with gr.Row():
@@ -1011,6 +1049,7 @@ def build_ui():
                                                size="sm")
 
                     with gr.Column(scale=7):
+                        job_notice = gr.Markdown(elem_id="st-job-notice")
                         with gr.Row(elem_classes="st-dl"):
                             dl_transcript = gr.DownloadButton("📥 文字起こし.md", interactive=False,
                                                               variant="primary")
@@ -1018,9 +1057,12 @@ def build_ui():
                             dl_srt = gr.DownloadButton("📥 字幕.srt", interactive=False)
                         with gr.Tabs():
                             with gr.Tab("📜 文字起こし"):
-                                transcript_html = gr.HTML(
+                                # Gradio 6.6のHTMLは連続更新時に古いDOMが残る。MarkdownのHTML表示を使う。
+                                # 本文・話者・音声URLはU.render_htmlがエスケープする。時刻クリックは残す。
+                                transcript_html = gr.Markdown(
                                     '<div style="padding:40px;text-align:center;opacity:.6">'
-                                    "ここに「時刻・話者・発言」が表示されます</div>")
+                                    "ここに「時刻・話者・発言」が表示されます</div>",
+                                    sanitize_html=False, latex_delimiters=[])
                             with gr.Tab("📋 議事録"):
                                 minutes_view = gr.Markdown()
                             with gr.Tab("💡 要約と考察"):
@@ -1247,7 +1289,7 @@ def build_ui():
 
         # ======================== イベント ========================
         view_outputs = [transcript_html, minutes_view, insights_view,
-                        dl_transcript, dl_minutes, dl_srt, speaker_table, edit_table]
+                        dl_transcript, dl_minutes, dl_srt, speaker_table, edit_table, job_notice]
 
         noise_preview_btn.click(fn=preview_noise_sample, inputs=[noise_source, noise_start, noise_end],
                                 outputs=noise_sample_player)

@@ -30,6 +30,11 @@ class SilenceGuardUITest(unittest.TestCase):
             demo = app.build_ui()
             try:
                 start = next(fn for fn in demo.fns.values() if fn.fn is app.run_batch)
+                transcript = start.outputs[2]
+                self.assertIsInstance(transcript, app.gr.Markdown)
+                self.assertFalse(transcript.sanitize_html)
+                self.assertEqual(transcript.latex_delimiters, [])
+                self.assertEqual(start.outputs[-2].elem_id, "st-job-notice")
                 bound = inspect.signature(app.run_batch).bind(*[c.value for c in start.inputs])
                 self.assertIs(bound.arguments["silence_guard"], False)
                 guard = next(c for c in start.inputs if c.label == "無音付近の誤認識を除外（内部スキップ）")

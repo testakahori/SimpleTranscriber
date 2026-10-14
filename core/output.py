@@ -1,7 +1,9 @@
 """output/ フォルダへの構造化出力"""
 import datetime
 import json
+import os
 import re
+import tempfile
 from pathlib import Path
 
 from .config import OUTPUT_DIR
@@ -28,17 +30,26 @@ def create_job_dir(source_filename: str) -> Path:
 
 
 def write_text(job_dir: Path, filename: str, content: str) -> Path:
-    path = job_dir / filename
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+    """同じフォルダの一時ファイルから置換し、書き込み失敗時は前回の保存を残す。"""
+    path = Path(job_dir) / filename
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                         dir=path.parent, prefix=f".{path.name}.",
+                                         suffix=".tmp", delete=False) as f:
+            temp = Path(f.name)
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, path)
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
     return path
 
 
 def write_meta(job_dir: Path, meta: dict) -> Path:
-    path = job_dir / "meta.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-    return path
+    return write_text(job_dir, "meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
 
 
 def list_jobs() -> list[str]:
@@ -62,10 +73,7 @@ def job_path(job_name: str) -> Path:
 
 
 def save_json(job_dir: Path, filename: str, data) -> Path:
-    path = Path(job_dir) / filename
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    return path
+    return write_text(job_dir, filename, json.dumps(data, ensure_ascii=False))
 
 
 def load_json(job_dir: Path, filename: str, default=None):
@@ -80,5 +88,6 @@ def load_json(job_dir: Path, filename: str, default=None):
 
 
 def list_editable_jobs() -> list[str]:
-    """発言データ(utterances.json)を持つ＝アプリで開き直せるジョブ"""
-    return [j for j in list_jobs() if (OUTPUT_DIR / j / "utterances.json").exists()]
+    """完成した発言データ、または途中保存をアプリで開けるジョブ。"""
+    return [j for j in list_jobs() if any((OUTPUT_DIR / j / name).exists()
+            for name in ("utterances.json", "checkpoint.json"))]
