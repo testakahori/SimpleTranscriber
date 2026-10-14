@@ -3,6 +3,8 @@
 GPUを使う処理は core.worker から別プロセスで呼ばれる（終わるとVRAM・RAMが全部OSに返る）。
 このモジュールは gradio を読み込まない（別プロセスの起動を軽くするため）。
 """
+import copy
+import json
 import logging
 import re
 from pathlib import Path
@@ -87,74 +89,101 @@ def learn_voices(job: dict, progress=None) -> str:
     return "🔊 この会議の声で声紋を学習しました（" + "、".join(learned) + "）。次回から自動で名前が付きます。"
 
 
-def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
-    """フェーズ1: 音声変換 → 文字起こし → 話者分離 → 発話構築（GPU: Whisper / ECAPA）"""
-    name = Path(path).name
-    job_dir = output.create_job_dir(name)
+def _run_options(opts, settings):
+    """再開に必要な選択だけ保存。APIトークン等を含む設定全体は保存しない。"""
+    values = dict(model="auto", speed="accurate", language="ja", num_speakers=0,
+                  noise=False, eq=True, fillers=True, diarize=False, use_llm=False,
+                  meeting_date="", memo="",
+                  decoding=settings.get("whisper", {}).get("decoding", "stable"),
+                  silence_guard=settings.get("whisper", {}).get("silence_guard", True))
+    return {key: opts.get(key, default) for key, default in values.items()}
 
-    sub(0.01, "音声を変換中...")
-    wav = audio.prepare_audio(path)
-    asr_wav = wav
+
+def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
+    job_dir = output.create_job_dir(Path(path).name)
+    with checkpoints.job_lock(job_dir):
+        return _run_transcription(job_dir, path, _run_options(opts, settings), settings, sub)
+
+
+def resume_job(job_dir: str, paths: list[str], opts: dict, settings: dict, progress=None) -> dict:
+    """別プロセスから、同じ保存先・同じ音声・同じ認識設定で続きを実行する。"""
+    folder = Path(job_dir)
+    with checkpoints.job_lock(folder):
+        if (folder / "utterances.json").exists():
+            raise ValueError("この文字起こしは完了済みです。履歴から開き直してください。")
+        data = json.loads((folder / checkpoints.FILENAME).read_text(encoding="utf-8"))
+        checkpoints.validate(data)
+        if data.get("resume_audio"):
+            if not data.get("run_options") or not isinstance(data.get("hints"), dict):
+                raise ValueError("再開用の認識設定が見つかりません。元の保存フォルダを復元してください。")
+            opts = dict(data["run_options"])
+            settings = copy.deepcopy(settings)
+            for section, values in data.get("processing_settings", {}).items():
+                settings.setdefault(section, {}).update(values)
+            path = None
+        else:
+            if len(paths) != 1 or Path(paths[0]).name != data["source"]:
+                raise ValueError("旧形式の途中保存です。同じ名前の元音声を1件だけ選び、認識設定を当時の値に合わせてください。")
+            path = paths[0]
+            opts = _run_options(opts, settings)
+        opts.update(meeting_date=data.get("meeting_date", ""), memo=data.get("memo", ""))
+        return _run_transcription(folder, path, opts, settings, progress or (lambda f, d: None), data)
+
+
+def _run_transcription(job_dir, path, opts, settings, sub, resume=None):
+    name = resume["source"] if resume else Path(path).name
+    temporary = set()
     checkpoint = None
     try:
-        duration = audio.get_duration(wav)
+        people_list = people.load_people()
+        if resume and resume.get("resume_audio"):
+            sub(0.01, "保存された音声を確認中...")
+            wav, asr_wav = checkpoints.audio_paths(job_dir, resume)
+            duration = resume["duration"]
+            records, hints = resume["resume_audio"], resume["hints"]
+        else:
+            sub(0.01, "音声を変換中...")
+            wav = audio.prepare_audio(path)
+            temporary.add(wav)
+            duration = audio.get_duration(wav)
+            if resume and abs(duration - resume["duration"]) > 0.1:
+                raise ValueError("選択した音声の長さが途中保存と一致しません。同じ元音声を選んでください。")
+            if resume:
+                duration = resume["duration"]
+            sub(0.03, "文字起こし用の音声を準備中...")
+            asr_wav = audio.enhance_for_asr(wav, eq=opts["eq"], noise_reduction=opts["noise"])
+            temporary.add(asr_wav)
+            records = checkpoints.keep_audio(job_dir, wav, asr_wav)
+            terms = people.initial_prompt_terms(people_list)
+            hints = dict(initial_prompt=glossary.build_initial_prompt(terms), hotwords=glossary.build_hotwords(terms))
         checkpoint = checkpoints.Writer(job_dir, name, duration,
                                          opts.get("meeting_date") or _meeting_date_from_name(name),
-                                         opts.get("memo", ""))
-        preview = audio.make_preview_audio(path, str(job_dir / "audio.m4a"))
-        if opts["noise"]:
-            sub(0.03, "文字起こし用に音声を補正中（ノイズ除去）...")
-        asr_wav = audio.enhance_for_asr(wav, eq=opts.get("eq", True), noise_reduction=opts["noise"])
-
-        people_list = people.load_people()
-        terms = people.initial_prompt_terms(people_list)
-        sub(0.05, "文字起こし中...")
-        result = transcriber.transcribe(
-            asr_wav, model_name=opts["model"], language=opts["language"],
-            initial_prompt=glossary.build_initial_prompt(terms),
-            hotwords=glossary.build_hotwords(terms),
-            duration=duration, speed=opts.get("speed", "accurate"),
-            decoding=opts.get("decoding", settings.get("whisper", {}).get("decoding", "stable")),
-            silence_guard=opts.get("silence_guard", settings.get("whisper", {}).get("silence_guard", True)),
-            progress_cb=lambda f, desc=None: sub(0.05 + 0.75 * f, desc or f"文字起こし中... {int(f * 100)}%"),
-            checkpoint_cb=checkpoint,
-        )
-        checkpoint({"phase": "postprocess", "segments": result["segments"], "processed_sec": duration})
-        punctuate.punctuate_segments(result["segments"])  # 「、」「。」を推定して補う
-
-        word_speakers, cluster_embeddings, matched = {}, {}, {}
-        if opts["diarize"] and diarization.available():
-            sub(0.82, "話者を識別中（声紋照合）...")
-            dia = settings.get("diarization", {})
-            word_speakers, cluster_embeddings, matched = diarization.diarize(
-                wav, result["segments"],
-                num_speakers=int(opts["num_speakers"] or 0),
-                max_speakers=int(dia.get("max_speakers", 12)), hf_token=dia.get("hf_token", ""),
-                match_similarity=float(dia.get("match_similarity", 0.55)),
+                                         opts.get("memo", ""), seed=resume)
+        checkpoint.base.update(resume_audio=records, run_options=opts, hints=hints,
+                               processing_settings={
+                                   "postprocess": {"red_threshold": settings.get("postprocess", {}).get("red_threshold", 0.5)},
+                                   "diarization": {key: settings.get("diarization", {}).get(key, default)
+                                                   for key, default in (("max_speakers", 12), ("match_similarity", 0.55), ("auto_learn", True))},
+                               })
+        checkpoint({**(resume or dict(phase="prepared", segments=[], processed_sec=0)), "interrupted": False})
+        preview_path = job_dir / "audio.m4a"
+        preview = str(preview_path) if preview_path.exists() else audio.make_preview_audio(path or wav, str(preview_path))
+        if resume and resume["phase"] == "postprocess":
+            # 旧形式には認識統計がないため、分かる範囲だけ復元する。
+            result = {**dict(model=opts["model"], speed=opts["speed"], decoding=opts["decoding"],
+                            silence_guard=opts["silence_guard"], device="以前の処理", duration=duration),
+                      **resume.get("asr_result", {}), "segments": copy.deepcopy(resume["segments"])}
+        else:
+            sub(0.05, "保存位置から文字起こしを再開中..." if resume else "文字起こし中...")
+            result = transcriber.transcribe(
+                asr_wav, model_name=opts["model"], language=opts["language"], **hints,
+                duration=duration, speed=opts["speed"], decoding=opts["decoding"], silence_guard=opts["silence_guard"],
+                progress_cb=lambda f, desc=None: sub(0.05 + 0.75 * f, desc or f"文字起こし中... {int(f * 100)}%"),
+                checkpoint_cb=checkpoint, resume=resume,
             )
-
-        threshold = settings.get("postprocess", {}).get("red_threshold", 0.5)
-        utts = U.build_utterances(result["segments"], word_speakers, threshold)
-        fillers = 0
-        if opts.get("fillers", True):
-            utts, fillers = U.remove_fillers(utts, threshold)
-        _finalize_text(utts, people_list)
-
-        # 声紋DBとはっきり一致した人は、この会議の声もすぐ学習する（あいまいな一致は、
-        # ②で確かめてから「③ 議事録を作る」の時に学習する）
-        # 「はっきり」の判定は、会議ごとの塊ではなく声紋全体の代表との類似度で行う
-        # （塊が多いほど偶然しきい値を超えやすく、間違いを自分で学習し続けるのを防ぐ）
-        dia = settings.get("diarization", {})
-        overall = diarization.load_voiceprints() if matched else {}
-        thr = float(dia.get("match_similarity", 0.55))
-        sure = {n for n in matched if n in overall and n in cluster_embeddings
-                and float(overall[n] @ cluster_embeddings[n]) >= thr}
-        if sure and dia.get("auto_learn", True):
-            sub(0.97, "声紋を学習中...")
-            try:
-                diarization.learn_from_utterances(wav, utts, _voice_tag(job_dir), only=sure)
-            except Exception as e:
-                logging.warning(f"声紋の学習に失敗: {e}")
+        checkpoint({"phase": "postprocess", "segments": copy.deepcopy(result["segments"]),
+                    "processed_sec": duration, "asr_result": {k: v for k, v in result.items() if k != "segments"}})
+        job = _finish_transcription(job_dir, name, wav, preview, duration, result, opts, settings, people_list, sub)
     except Exception:
         if checkpoint is not None:
             try:
@@ -163,9 +192,52 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
                 logging.exception("途中結果の最終保存に失敗しました。前回の保存は保持します")
         raise
     finally:
-        Path(wav).unlink(missing_ok=True)
-        if asr_wav != wav:
-            Path(asr_wav).unlink(missing_ok=True)
+        for filename in temporary:
+            Path(filename).unlink(missing_ok=True)
+    # 完成データを公開できてから削除。保存に失敗した場合にも音声を残す。
+    try:
+        checkpoints.cleanup_audio(job_dir)
+    except OSError:
+        logging.warning("文字起こしは完了しましたが再開用音声の削除に失敗しました", exc_info=True)
+    return job
+
+
+def _finish_transcription(job_dir, name, wav, preview, duration, result, opts, settings, people_list, sub):
+    punctuate.punctuate_segments(result["segments"])  # 「、」「。」を推定して補う
+
+    word_speakers, cluster_embeddings, matched = {}, {}, {}
+    if opts["diarize"] and diarization.available():
+        sub(0.82, "話者を識別中（声紋照合）...")
+        dia = settings.get("diarization", {})
+        word_speakers, cluster_embeddings, matched = diarization.diarize(
+            wav, result["segments"],
+            num_speakers=int(opts["num_speakers"] or 0),
+            max_speakers=int(dia.get("max_speakers", 12)), hf_token=dia.get("hf_token", ""),
+            match_similarity=float(dia.get("match_similarity", 0.55)),
+        )
+
+    threshold = settings.get("postprocess", {}).get("red_threshold", 0.5)
+    utts = U.build_utterances(result["segments"], word_speakers, threshold)
+    fillers = 0
+    if opts.get("fillers", True):
+        utts, fillers = U.remove_fillers(utts, threshold)
+    _finalize_text(utts, people_list)
+
+    # 声紋DBとはっきり一致した人は、この会議の声もすぐ学習する（あいまいな一致は、
+    # ②で確かめてから「③ 議事録を作る」の時に学習する）
+    # 「はっきり」の判定は、会議ごとの塊ではなく声紋全体の代表との類似度で行う
+    # （塊が多いほど偶然しきい値を超えやすく、間違いを自分で学習し続けるのを防ぐ）
+    dia = settings.get("diarization", {})
+    overall = diarization.load_voiceprints() if matched else {}
+    thr = float(dia.get("match_similarity", 0.55))
+    sure = {n for n in matched if n in overall and n in cluster_embeddings
+            and float(overall[n] @ cluster_embeddings[n]) >= thr}
+    if sure and dia.get("auto_learn", True):
+        sub(0.97, "声紋を学習中...")
+        try:
+            diarization.learn_from_utterances(wav, utts, _voice_tag(job_dir), only=sure)
+        except Exception as e:
+            logging.warning(f"声紋の学習に失敗: {e}")
 
     speed_label = dict((v, k) for k, v in transcriber.SPEED_CHOICES).get(result.get("speed"), "")
     meta_line = f"モデル: {result.get('model')}（{result.get('device')}・{speed_label.split('（')[0]}）"
@@ -180,6 +252,7 @@ def _transcribe_one(path: str, opts: dict, settings: dict, sub) -> dict:
     job = {
         "job_dir": str(job_dir),
         "source": name,
+        "run_options": opts,
         "duration": duration,
         "meta_line": meta_line,
         "meeting_date": opts.get("meeting_date") or _meeting_date_from_name(name),

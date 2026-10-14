@@ -3,11 +3,35 @@ import logging
 import shutil
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".wma", ".opus"}
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".ts", ".m4v", ".webm"}
 SUPPORTED_EXTS = sorted(AUDIO_EXTS | VIDEO_EXTS)
+
+
+@contextmanager
+def asr_tail(wav_path: str, start: float):
+    """再開位置以降のPCMを切り出す。前処理を掛け直さず、VADは通常どおり使う。"""
+    if start <= 0:
+        yield wav_path, 0.0
+        return
+    import soundfile as sf
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    try:
+        with sf.SoundFile(wav_path) as src:
+            frame = min(int(start * src.samplerate), len(src))
+            src.seek(frame)
+            offset = frame / src.samplerate
+            with sf.SoundFile(tmp.name, "w", samplerate=src.samplerate,
+                              channels=src.channels, subtype=src.subtype) as dst:
+                while len(data := src.read(65536, dtype="float32")):
+                    dst.write(data)
+        yield tmp.name, offset
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
 
 
 class AudioError(Exception):
