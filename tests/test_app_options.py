@@ -30,6 +30,11 @@ class SilenceGuardUITest(unittest.TestCase):
             demo = app.build_ui()
             try:
                 start = next(fn for fn in demo.fns.values() if fn.fn is app.run_batch)
+                resume = next(fn for fn in demo.fns.values() if fn.fn is app.resume_transcription)
+                self.assertEqual(resume.inputs[1:], start.inputs)
+                self.assertEqual(resume.outputs, start.outputs)
+                self.assertEqual(resume.concurrency_id, start.concurrency_id)
+                self.assertEqual(start.concurrency_id, "asr")
                 transcript = start.outputs[2]
                 self.assertIsInstance(transcript, app.gr.Markdown)
                 self.assertFalse(transcript.sanitize_html)

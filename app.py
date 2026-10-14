@@ -221,20 +221,51 @@ def _write_meta(job: dict, opts: dict, settings: dict) -> None:
     })
 
 
+def _recognition_options(model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on,
+                         meeting_date, memo, decoding, silence_guard):
+    return {
+        "model": model_name, "speed": speed, "language": language, "num_speakers": num_speakers,
+        "decoding": decoding, "silence_guard": silence_guard,
+        "noise": noise, "eq": eq_on, "fillers": fillers_on, "diarize": diarize_on, "use_llm": False,
+        "meeting_date": (meeting_date or "").strip(), "memo": (memo or "").strip(),
+    }
+
+
+def resume_transcription(state, files, model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on,
+                         meeting_date, memo, decoding="stable", silence_guard=True, progress=gr.Progress()):
+    if not state or not state.get("incomplete"):
+        return ("⚠️ 履歴から「途中保存」の結果を開いてください。", gr.update()) + \
+            tuple(gr.update() for _ in range(VIEW_COUNT)) + (refresh_history(),)
+    settings = config.load_settings()
+    opts = _recognition_options(model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on,
+                                meeting_date, memo, decoding, silence_guard)
+    paths = [f if isinstance(f, str) else f.name for f in files or []]
+    job_name = Path(state["job_dir"]).name
+    try:
+        llm.unload_ollama(settings)
+        progress(0, desc="途中保存を確認中...")
+        job = worker.run("core.pipeline:resume_job", state["job_dir"], paths, opts, settings,
+                         progress=lambda f, d: progress(f, desc=d))
+        _write_meta(job, job["run_options"], settings)
+        message = (f"✅ **{job['source']}** の続きを処理し、同じ保存先に完成版を保存しました。"
+                   "次は ② 確認・修正で本文と話者名を確認してください。")
+    except Exception as e:
+        logging.error(traceback.format_exc())
+        message = f"⚠️ 再開処理を完了できませんでした: {e}。保存済みの結果は保持しています。"
+        job = _load_job(job_name) or state
+    return (message, job) + _job_views(job) + (
+        gr.update(choices=output.list_editable_jobs(), value=job_name),)
+
+
 def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on,
               meeting_date, memo, decoding="stable", silence_guard=True, progress=gr.Progress()):
     """① 音声 → 文字起こし（話者識別まで）。AIの校正・議事録は②③で別に行う"""
     if not files:
         return ("⚠️ ファイルを選択してください。", gr.update()) + \
             tuple(gr.update() for _ in range(VIEW_COUNT)) + (gr.update(),)
-
     settings = config.load_settings()
-    opts = {
-        "model": model_name, "speed": speed, "language": language, "num_speakers": num_speakers,
-        "decoding": decoding, "silence_guard": silence_guard,
-        "noise": noise, "eq": eq_on, "fillers": fillers_on, "diarize": diarize_on, "use_llm": False,
-        "meeting_date": (meeting_date or "").strip(), "memo": (memo or "").strip(),
-    }
+    opts = _recognition_options(model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on,
+                                meeting_date, memo, decoding, silence_guard)
     paths = [f if isinstance(f, str) else f.name for f in files]
     n = len(paths)
 
@@ -1035,7 +1066,7 @@ def build_ui():
                                 label="話者識別・声紋照合" + ("" if dia_available else "（未導入）"))
                         start_btn = gr.Button("① 🚀 文字起こし開始", variant="primary", size="lg")
                         gr.Markdown("<small>①は音声の文字起こしと話者識別だけを行います。"
-                                    "認識中は途中保存し、停止した場合は履歴から開けます（続きからの再開は未対応）。"
+                                    "認識中は途中保存し、停止した場合は履歴から開いて続きを再開できます。"
                                     "AI校正（②）と議事録（③）は、確認・修正のあと右側のボタンで別に実行します。</small>")
                         result_md = gr.Markdown(elem_id="st-summary")
                         with gr.Row():
@@ -1043,6 +1074,9 @@ def build_ui():
                                 label="📂 過去の結果を開く", choices=output.list_editable_jobs(),
                                 scale=4)
                             history_refresh = gr.Button("🔄", scale=1, min_width=40)
+                        resume_btn = gr.Button("▶ 途中保存から再開", size="sm")
+                        gr.Markdown("<small>履歴から途中保存を開いて再開します。保存時の音声・設定を使うため、"
+                                    "新しい形式の結果はファイルの再選択が不要です。境界付近だけ聞き直します。</small>")
                         rediarize_btn = gr.Button("👥 話者識別だけやり直す（上の「話者の人数」を使用）",
                                                   size="sm")
                         reflow_btn = gr.Button("✂️ 文の区切り・句読点を整え直す（数秒・音声解析なし）",
@@ -1301,6 +1335,14 @@ def build_ui():
             inputs=[files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, eq_cb, fillers_cb, diarize_cb,
                     meeting_date_box, memo_box, decoding_radio, silence_guard_cb],
             outputs=[result_md, job_state] + view_outputs + [history_dd],
+            concurrency_id="asr",
+        ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
+
+        resume_btn.click(
+            fn=resume_transcription,
+            inputs=[job_state, files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, eq_cb,
+                    fillers_cb, diarize_cb, meeting_date_box, memo_box, decoding_radio, silence_guard_cb],
+            outputs=[result_md, job_state] + view_outputs + [history_dd], concurrency_id="asr",
         ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
 
         speed_radio.change(fn=lambda speed: gr.update(interactive=speed != "fast"),

@@ -1,5 +1,6 @@
 """faster-whisper による文字起こし（GPU自動検出・単語タイムスタンプ付き）"""
 import gc
+import copy
 import logging
 import re
 import time
@@ -162,7 +163,8 @@ def _missed_spans(wav_path: str, segments: list[dict], total: float) -> list[tup
     except Exception as e:
         logging.warning(f"発話検出に失敗したため、文字の無い長い区間だけを確認します: {e}")
         edges = [-COVER_PAD_SEC] + [x for c in covered for x in c] + [total + COVER_PAD_SEC]
-        return [(a, b) for a, b in zip(edges[::2], edges[1::2]) if b - a >= GAP_RETRY_SEC]
+        return [(max(0.0, a), min(total, b)) for a, b in zip(edges[::2], edges[1::2])
+                if min(total, b) - max(0.0, a) >= GAP_RETRY_SEC]
 
     # 声の区間から、文字がある所を引く
     missed = []
@@ -186,7 +188,7 @@ def _missed_spans(wav_path: str, segments: list[dict], total: float) -> list[tup
 
 
 def _fill_gaps(model, wav_path: str, segments: list[dict], total: float, kwargs: dict,
-               progress_cb=None, checkpoint_cb=None) -> dict:
+               progress_cb=None, checkpoint_cb=None, resume_state=None) -> dict:
     """声があるのに文字が無い部分を、前の文脈を使わずにもう一度文字起こしして segments に足す。
 
     Whisperは「無音らしく自信も低い」30秒窓を黙って飛ばす。前の発言を文脈にしていると、
@@ -196,8 +198,9 @@ def _fill_gaps(model, wav_path: str, segments: list[dict], total: float, kwargs:
               "missing_sec": やり直しても文字にならなかった声の長さ}"""
     import soundfile as sf
 
-    stats = {"dropped": 0, "refilled_sec": 0.0, "missing_sec": 0.0}
-    spans = _missed_spans(wav_path, segments, total)
+    stats = dict((resume_state or {}).get("stats") or {"dropped": 0, "refilled_sec": 0.0, "missing_sec": 0.0})
+    spans = resume_state["spans"] if resume_state else _missed_spans(wav_path, segments, total)
+    first = resume_state.get("next_index", 0) if resume_state else 0
     if not spans:
         return stats
     rate = sf.info(wav_path).samplerate
@@ -205,7 +208,17 @@ def _fill_gaps(model, wav_path: str, segments: list[dict], total: float, kwargs:
     kwargs = {k: v for k, v in kwargs.items() if k not in ("initial_prompt", "hotwords")}
     kwargs.update(condition_on_previous_text=False, temperature=list(GAP_TEMPERATURES))
     added = []
-    for i, (a, b) in enumerate(spans):
+
+    def save_progress(completed):
+        if checkpoint_cb:
+            checkpoint_cb({"phase": "recovery", "segments": sorted(segments + added, key=lambda s: s["start"]),
+                           "duration": total, "processed_sec": total,
+                           "completed_spans": completed, "total_spans": len(spans),
+                           "recovery": {"spans": spans, "next_index": completed, "stats": dict(stats)}})
+
+    save_progress(first)  # 1窓目の処理前に計画を保存。文字にならなかった窓も再開時に繰り返さない。
+    for i in range(first, len(spans)):
+        a, b = spans[i]
         if progress_cb:
             try:
                 progress_cb(i / len(spans), f"聞き取れなかった所をやり直し中... {i + 1}/{len(spans)}か所")
@@ -238,9 +251,7 @@ def _fill_gaps(model, wav_path: str, segments: list[dict], total: float, kwargs:
         if n:
             stats["refilled_sec"] += b - a
             logging.warning(f"文字起こしの抜けを補いました: {a:.0f}s〜{b:.0f}s（{n}区間）")
-        if checkpoint_cb:
-            checkpoint_cb({"phase": "recovery", "segments": sorted(segments + added, key=lambda s: s["start"]),
-                           "duration": total, "completed_spans": i + 1, "total_spans": len(spans)})
+        save_progress(i + 1)
     segments.extend(added)
     segments.sort(key=lambda s: s["start"])
     remain = _missed_spans(wav_path, segments, total)
@@ -253,16 +264,27 @@ def _fill_gaps(model, wav_path: str, segments: list[dict], total: float, kwargs:
     return stats
 
 
+def resume_boundary(data: dict) -> float:
+    """境界の語頭を保護するため2秒戻し、その位置にかかる発言は先頭から聞き直す。"""
+    boundary = max(0.0, float(data.get("processed_sec", 0)) - 2.0)
+    while True:
+        crossings = [s["start"] for s in data.get("segments", []) if s["start"] < boundary < s["end"]]
+        if not crossings:
+            return boundary
+        boundary = min(crossings)
+
+
 def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
                initial_prompt: str = "", hotwords: str = "", duration: float = 0.0,
                progress_cb=None, speed: str = "accurate", decoding: str = "stable",
-               checkpoint_cb=None, silence_guard: bool = True) -> dict:
+               checkpoint_cb=None, silence_guard: bool = True, resume: dict | None = None) -> dict:
     """文字起こしを実行し、単語レベル確信度付きのセグメント一覧を返す。
 
     checkpoint_cb: 認識済みの中間結果を同期的に受け取る任意の保存関数。
         呼び出し側で保存頻度を制御する。保存失敗は握りつぶさず呼び出し元へ返す。
     silence_guard: faster-whisper内の無音に囲まれた誤認のスキップ。
         雑音で1秒刻みの再認識が続く場合は無効化できる。VAD・外側の除外は維持。
+    resume: 保存済みのセグメント・処理段階・補完計画。主認識中なら境界付近だけ戻して再開する。
     Returns:
         {
           "language": str, "duration": float, "elapsed": float,
@@ -275,7 +297,8 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
     if decoding not in {value for _, value in DECODING_CHOICES}:
         raise ValueError(f"不明な認識方式: {decoding}")
     device, _ = detect_device()
-    name = resolve_model_name(model_name, device)
+    saved_info = (resume or {}).get("asr_info", {})
+    name = saved_info.get("model") or resolve_model_name(model_name, device)
     model = get_model(name)
 
     kwargs = dict(
@@ -290,6 +313,7 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=300),
     )
+    language = saved_info.get("language") or language
     if language and language != "auto":
         kwargs["language"] = language
     engine = model
@@ -312,31 +336,46 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
         if hotwords and decoding == "context":
             kwargs["hotwords"] = hotwords[:500]
 
+    from .audio import asr_tail
     start_time = time.time()
-    segments_iter, info = engine.transcribe(wav_path, **kwargs)
+    previous_elapsed = (resume or {}).get("elapsed", 0.0)
+    total = duration or (resume or {}).get("duration", 0.0)
+    segments = copy.deepcopy((resume or {}).get("segments", []))
+    dropped = (resume or {}).get("dropped", 0)
+    info_dict = dict(model=name, device=device, language=language, speed=speed,
+                     decoding="batched" if speed == "fast" else decoding,
+                     silence_guard=silence_guard if speed != "fast" else None)
 
-    total = duration or getattr(info, "duration", 0.0) or 0.0
-    segments = []
-    dropped = 0
-    for seg in segments_iter:
-        if progress_cb and total > 0:
-            try:
-                progress_cb(MAIN_PASS_SHARE * min(seg.end / total, 1.0))
-            except Exception:
-                pass
-        if _is_hallucination(seg):
-            dropped += 1
-            logging.info(f"ハルシネーション疑いを除外: [{seg.start:.1f}s] {seg.text.strip()[:40]}")
-        else:
-            segments.append(_segment_dict(seg))
+    def emit(snapshot):
         if checkpoint_cb:
-            checkpoint_cb({"phase": "main", "segments": segments, "duration": total,
-                           "processed_sec": float(seg.end), "dropped": dropped})
-        logging.info(f"進捗: [{seg.start:.1f}s -> {seg.end:.1f}s]")
+            checkpoint_cb({**snapshot, "asr_info": dict(info_dict),
+                           "elapsed": previous_elapsed + time.time() - start_time})
 
-    if checkpoint_cb:
-        checkpoint_cb({"phase": "main_complete", "segments": segments, "duration": total,
-                       "processed_sec": total, "dropped": dropped})
+    main_done = resume and resume.get("phase") in ("main_complete", "recovery", "postprocess")
+    if not main_done:
+        start = resume_boundary(resume) if resume else 0.0
+        segments = [s for s in segments if s["end"] <= start]
+        with asr_tail(wav_path, start) as (tail, offset):
+            segments_iter, info = engine.transcribe(tail, **kwargs)
+            total = total or getattr(info, "duration", 0.0) or 0.0
+            info_dict["language"] = getattr(info, "language", language)
+            for seg in segments_iter:
+                end = min(total, float(seg.end) + offset) if total else float(seg.end) + offset
+                if progress_cb and total > 0:
+                    try:
+                        progress_cb(MAIN_PASS_SHARE * min(end / total, 1.0))
+                    except Exception:
+                        pass
+                if _is_hallucination(seg):
+                    dropped += 1
+                    logging.info(f"ハルシネーション疑いを除外: [{seg.start + offset:.1f}s] {seg.text.strip()[:40]}")
+                else:
+                    segments.append(_segment_dict(seg, offset))
+                emit({"phase": "main", "segments": segments, "duration": total,
+                      "processed_sec": end, "dropped": dropped})
+                logging.info(f"進捗: [{seg.start + offset:.1f}s -> {seg.end + offset:.1f}s]")
+        emit({"phase": "main_complete", "segments": segments, "duration": total,
+              "processed_sec": total, "dropped": dropped})
 
     retry_kwargs = {k: v for k, v in kwargs.items() if k not in ("batch_size", "chunk_length")}
     fill_cb = None
@@ -344,13 +383,14 @@ def transcribe(wav_path: str, model_name: str = "auto", language: str = "ja",
         def fill_cb(f, desc):
             progress_cb(MAIN_PASS_SHARE + (1 - MAIN_PASS_SHARE) * f, desc)
     fill = _fill_gaps(model, wav_path, segments, total, retry_kwargs,
-                      progress_cb=fill_cb, checkpoint_cb=checkpoint_cb)
+                      progress_cb=fill_cb, checkpoint_cb=emit if checkpoint_cb else None,
+                      resume_state=(resume or {}).get("recovery") if main_done else None)
     dropped += fill["dropped"]
 
-    elapsed = time.time() - start_time
+    elapsed = previous_elapsed + time.time() - start_time
     logging.info(f"文字起こし完了 ({elapsed:.1f}秒, model={name}, device={device}, 除外={dropped})")
     return {
-        "language": getattr(info, "language", language),
+        "language": info_dict["language"],
         "duration": total,
         "elapsed": elapsed,
         "model": name,
