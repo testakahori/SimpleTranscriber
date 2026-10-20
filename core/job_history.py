@@ -28,7 +28,7 @@ def load(folder: Path):
 
 def ensure_current(job: dict) -> None:
     if "_revision" in job and job["_revision"] != revision(Path(job["job_dir"])):
-        raise ConflictError("別の画面でこの結果が更新されています。編集内容を控え、未保存の編集を破棄して履歴から開き直してください。")
+        raise ConflictError("別の画面でこの結果が更新されています。編集内容を控え、「保存済みの内容に戻す」で最新の本文を読み直してください。")
 
 
 def save(job: dict, writer, action="発言の修正", backup=True) -> None:

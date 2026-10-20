@@ -461,7 +461,7 @@ def _marked_slices(marked: str, plain_len: int):
 def sentence_rows(utterances: list[dict]) -> list[dict]:
     """発話を1文ずつに区切った行 [{start, end, speaker, text, marked}]"""
     rows = []
-    for u in utterances:
+    for ui, u in enumerate(utterances, 1):
         text = u.get("text", "")
         if not text.strip():
             continue
@@ -493,6 +493,7 @@ def sentence_rows(utterances: list[dict]) -> list[dict]:
                 rows.append({"start": times[lo][0] if times else u["start"],
                              "end": times[hi - 1][1] if times else u["end"],
                              "speaker": u.get("speaker", ""),
+                             "utterance_index": ui, "review_pending": bool(u.get("proofread_pending")),
                              "text": text[lo:hi], "marked": frag.replace(RED_OPEN + RED_CLOSE, "")})
             start = cut
     return rows
@@ -582,6 +583,14 @@ button.st-time{background:transparent;border:0;padding:4px 0;text-align:left}
 .st-sp{font-weight:700}
 .st-text{white-space:pre-wrap;word-break:break-word}
 .st-red{color:#dc2626;background:rgba(220,38,38,.08);border-radius:3px}
+.st-red{text-decoration:underline dotted;text-underline-offset:3px}
+.st-review-bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:10px 0}
+.st-review-bar button{padding:8px 14px;border:1px solid var(--border-color-primary,#ccc);border-radius:6px;
+  background:var(--background-fill-secondary,#f8fafc);color:inherit;cursor:pointer;font:inherit}
+.st-review-bar button:focus-visible,.st-list:focus-visible,.st-u:focus{outline:2px solid #a74608;outline-offset:2px}
+.st-review-badge{display:inline-block;margin-left:8px;padding:1px 7px;background:#fffbeb;color:#92400e;
+  border:1px solid #d6a85c;border-radius:4px;font-size:12px;font-weight:600}
+.st-review-position{font-size:13px}
 .st-legend{font-size:12px;color:var(--body-text-color-subdued,#71717a);margin-bottom:8px}
 .st-player{width:100%;margin:0 0 10px}
 
@@ -612,22 +621,40 @@ def render_html(utterances: list[dict], audio_url: str = "") -> str:
                 f'{pct:.0f}%</span>'
             )
         out.append("</div>")
-    legend = "赤字＝聞き取りに自信がない／AIが推測した箇所"
+    rows = sentence_rows(utterances)
+    needs_review = lambda row: RED_OPEN in row["marked"] or row["review_pending"]
+    review_count = sum(needs_review(row) for row in rows)
+    if review_count:
+        next_js = (
+            "var w=this.closest('.st-wrap'),r=w.querySelectorAll('.st-u[data-review=\"true\"]');"
+            "var i=(Number(w.dataset.reviewIndex??-1)+1)%r.length;w.dataset.reviewIndex=i;"
+            "r[i].scrollIntoView({block:'nearest'});r[i].focus({preventScroll:true});"
+            "w.querySelector('.st-review-position').textContent=(i+1)+' / '+r.length+' 箇所';"
+        )
+        out.append(f'<div class="st-review-bar"><strong>要確認 {review_count}箇所</strong>'
+                   f'<button type="button" onclick="{html.escape(next_js, quote=True)}">次の要確認へ</button>'
+                   '<span class="st-review-position" role="status" aria-live="polite"></span></div>')
+    legend = "「要確認」は聞き取りが不明瞭・AIの推測・校正の再確認がある箇所。本文の該当部分は赤字と下線で表示します。"
     if audio_url:
         legend += "　・　時刻をクリックするとその位置から再生"
     out.append(f'<div class="st-legend">{legend}</div>')
 
-    out.append('<div class="st-list">')
+    out.append('<div class="st-list" tabindex="0" role="region" aria-label="文字起こし本文">')
     seek_js = ("var a=document.getElementById('st-player');"
                "if(a){a.currentTime=%.2f;a.play();}")
     prev = None
-    for i, r in enumerate(sentence_rows(utterances), 1):
+    for r in rows:
         sp = r.get("speaker") or ""
         c = colors.get(sp, "#888")
         onclick = f' onclick="{seek_js % r["start"]}"' if audio_url else ""
         turn = " st-turn" if prev is not None and sp != prev else ""
         prev = sp
-        out.append(f'<div class="st-u{turn}"><div class="st-no">{i}</div>')
+        review = needs_review(r)
+        badge = ('<span class="st-review-badge">AI校正の再確認</span>' if r["review_pending"] else
+                 '<span class="st-review-badge">要確認</span>') if review else ""
+        out.append(f'<div class="st-u{turn}" tabindex="-1" role="group" data-review="{str(review).lower()}" '
+                   f'aria-label="発言{r["utterance_index"]}{" 要確認" if review else ""}">'
+                   f'<div class="st-no">発言 {r["utterance_index"]}{badge}</div>')
         tag = "button" if audio_url else "div"
         attrs = f' type="button" aria-label="{format_hms(r["start"])}から再生"' if audio_url else ""
         out.append(f'<{tag} class="st-time"{attrs}{onclick}>{format_srt_time(r["start"])} --&gt; '

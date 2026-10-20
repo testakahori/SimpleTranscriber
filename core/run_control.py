@@ -46,3 +46,12 @@ def request_pause(owner: str | None) -> bool:
             return False
         flag.touch(exist_ok=True)
         return True
+
+
+def status(owner: str | None) -> str | None:
+    """この画面が実行した文字起こしだけの状態を返す。UIの停止ボタンに使う。"""
+    with _lock:
+        flag = _active.get(owner)
+        if flag is None:
+            return None
+        return "pausing" if flag.is_file() else "running"
