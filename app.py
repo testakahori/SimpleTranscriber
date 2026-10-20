@@ -151,11 +151,10 @@ def _download_transcript(job: dict):
 
 def _download(job: dict, name: str):
     path = Path(job["job_dir"]) / name
-    label = "字幕.srt" if name == "transcript.srt" else name
     state = document_status.status(job, name)
     prefix = {"stale": "⚠️ 更新前: ", "unknown": "⚠️ 更新状況不明: "}.get(state, "📥 ")
     available = path.exists() and (not job.get("incomplete") or name == checkpoints.SNAPSHOT_TRANSCRIPT)
-    return gr.update(label=prefix + label, value=str(path) if available else None, interactive=available)
+    return gr.update(label=prefix + name, value=str(path) if available else None, interactive=available)
 
 
 def _speaker_rows(job: dict) -> list[list]:
@@ -174,11 +173,6 @@ def _edit_rows(job: dict) -> list[list]:
             for i, u in enumerate(job["utterances"])] or [[1, "", "", ""]]
 
 
-def _cue_rows(cues: list[dict]) -> list[list]:
-    return [[i + 1, U.format_srt_time(c["start"]), U.format_srt_time(c["end"]),
-             c.get("speaker", ""), c["text"]] for i, c in enumerate(cues)] or [[1, "", "", "", ""]]
-
-
 def _job_views(job: dict):
     """結果表示コンポーネント一式の更新値"""
     return (
@@ -187,7 +181,7 @@ def _job_views(job: dict):
         _read_md(job, "要約と考察.md") or "_要約と考察はまだありません（「💡 要約と考察を作る」で作成）_",
         _download_transcript(job),
         _download(job, "議事録.md"),
-        _download(job, "transcript.srt"),
+        _download(job, "要約と考察.md"),
         gr.update(value=_speaker_rows(job), interactive=not job.get("incomplete", False)),
         gr.update(value=_edit_rows(job), interactive=not job.get("incomplete", False)),
         "\n\n".join(filter(None, [checkpoints.notice(job)] +
@@ -659,141 +653,6 @@ def save_utterance_edits(rows, state):
 
 
 # =====================================================================
-# SRT編集
-# =====================================================================
-
-def _sub_opts(max_chars, max_lines, max_dur, min_dur, pause, spk_prefix, drop_period) -> dict:
-    return {
-        "max_chars_line": int(max_chars), "max_lines": int(max_lines),
-        "max_duration": float(max_dur), "min_duration": float(min_dur),
-        "pause_split": float(pause), "speaker_prefix": bool(spk_prefix),
-        "drop_period": bool(drop_period),
-    }
-
-
-def _rows_to_cues(rows) -> tuple[list[dict], list[str]]:
-    cues, errors = [], []
-    for i, row in enumerate(_rows(rows), 1):
-        text = _cell(row, 4)
-        if not text:
-            continue
-        try:
-            start, end = U.parse_time(_cell(row, 1)), U.parse_time(_cell(row, 2))
-        except ValueError as e:
-            errors.append(f"行{i}: {e}")
-            continue
-        cues.append({"start": start, "end": end, "speaker": _cell(row, 3), "text": text})
-    return cues, errors
-
-
-def _warn_md(cues, opts, extra=None) -> str:
-    warns = (extra or []) + U.validate_cues(cues, opts)
-    if not warns:
-        return f"✅ 問題なし（{len(cues)}枚）"
-    head = f"⚠️ {len(warns)}件の注意（{len(cues)}枚）"
-    return head + "\n\n" + "\n".join(f"- {w}" for w in warns[:30]) + \
-        ("\n- …" if len(warns) > 30 else "")
-
-
-def srt_regenerate(state, *sub_args):
-    if not state:
-        return gr.update(), "⚠️ 先に文字起こしを実行するか、過去の結果を開いてください。"
-    if state.get("incomplete"):
-        return gr.update(), checkpoints.READ_ONLY_NOTICE
-    opts = _sub_opts(*sub_args)
-    settings = config.load_settings()
-    settings["subtitle"] = opts
-    config.save_settings(settings)
-    cues = U.build_cues(state["utterances"], opts)
-    return _cue_rows(cues), _warn_md(cues, opts) + "（この分割設定は次回以降の既定値になります）"
-
-
-def srt_import(file, *sub_args):
-    if not file:
-        return gr.update(), "⚠️ ファイルを選んでください"
-    path = file if isinstance(file, str) else file.name
-    raw = Path(path).read_bytes()
-    for enc in ("utf-8-sig", "cp932", "utf-16"):
-        try:
-            text = raw.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
-    else:
-        return gr.update(), "❌ 文字コードを判別できませんでした"
-    cues = U.parse_srt(text, _people_names())
-    if not cues:
-        return gr.update(), "❌ 字幕を読み取れませんでした（SRT/VTT形式か確認してください）"
-    return _cue_rows(cues), f"📥 {len(cues)}枚の字幕を読み込みました\n\n" + \
-        _warn_md(cues, _sub_opts(*sub_args))
-
-
-def srt_autofix(rows, *sub_args):
-    opts = _sub_opts(*sub_args)
-    cues, errors = _rows_to_cues(rows)
-    if not cues:
-        return gr.update(), "⚠️ 字幕がありません"
-    fixed = U.finalize_cues(cues, opts, add_tail=False)
-    return _cue_rows(fixed), "🩺 自動修正しました（重なり解消・最小表示時間・改行位置）\n\n" + \
-        _warn_md(fixed, opts, errors)
-
-
-def srt_shift(rows, seconds, *sub_args):
-    cues, errors = _rows_to_cues(rows)
-    if not cues:
-        return gr.update(), "⚠️ 字幕がありません"
-    sec = float(seconds or 0)
-    for c in cues:
-        c["start"] = max(0.0, c["start"] + sec)
-        c["end"] = max(c["start"] + 0.1, c["end"] + sec)
-    return _cue_rows(cues), f"⏩ 全体を {sec:+.2f} 秒ずらしました\n\n" + \
-        _warn_md(cues, _sub_opts(*sub_args), errors)
-
-
-def srt_apply_learned(rows, *sub_args):
-    cues, errors = _rows_to_cues(rows)
-    people_list = people.load_people()
-    n = 0
-    for c in cues:
-        new = glossary.apply_corrections(people.apply_aliases(c["text"], people_list))
-        if new != c["text"]:
-            c["text"] = new
-            n += 1
-    return _cue_rows(cues), f"📚 人物マスタ・学習済み修正を適用しました（{n}枚を修正）\n\n" + \
-        _warn_md(cues, _sub_opts(*sub_args), errors)
-
-
-def srt_save(rows, state, *sub_args):
-    if state and state.get("incomplete"):
-        return None, checkpoints.READ_ONLY_NOTICE
-    opts = _sub_opts(*sub_args)
-    cues, errors = _rows_to_cues(rows)
-    if not cues:
-        return None, "⚠️ 字幕がありません"
-    cues.sort(key=lambda c: c["start"])
-    if state and state.get("job_dir"):
-        out_dir = Path(state["job_dir"])
-        stem = "transcript_edited"  # 自動生成(transcript.srt)とは別名 → 再生成で上書きされない
-    else:
-        out_dir = config.OUTPUT_DIR
-        stem = "edited_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    srt = out_dir / f"{stem}.srt"
-    vtt = out_dir / f"{stem}.vtt"
-    srt.write_text(U.cues_to_srt(cues, opts["speaker_prefix"]), encoding="utf-8")
-    vtt.write_text(U.cues_to_vtt(cues, opts["speaker_prefix"]), encoding="utf-8")
-    return [str(srt), str(vtt)], "💾 保存しました\n\n" + _warn_md(cues, opts, errors)
-
-
-def load_srt_for_state(state):
-    if not state:
-        return gr.update()
-    if state.get("incomplete"):
-        return _cue_rows([])
-    settings = config.load_settings()
-    return _cue_rows(U.build_cues(state["utterances"], settings.get("subtitle", {})))
-
-
-# =====================================================================
 # 人物・声紋
 # =====================================================================
 
@@ -1024,7 +883,6 @@ def status_line() -> str:
 
 def build_ui():
     settings = config.load_settings()
-    sub = settings.get("subtitle", {})
     dia_available = diarization.available()  # 軽い（パッケージの有無だけ見る）
     if not _probe_thread.is_alive() and not _devices:
         _probe_thread.start()
@@ -1118,7 +976,7 @@ def build_ui():
                             dl_transcript = gr.DownloadButton("📥 文字起こし.md", interactive=False,
                                                               variant="primary")
                             dl_minutes = gr.DownloadButton("📥 議事録.md", interactive=False)
-                            dl_srt = gr.DownloadButton("📥 字幕.srt", interactive=False)
+                            dl_insights = gr.DownloadButton("📥 要約と考察.md", interactive=False)
                         with gr.Tabs():
                             with gr.Tab("📜 文字起こし"):
                                 # Gradio 6.6のHTMLは連続更新時に古いDOMが残る。MarkdownのHTML表示を使う。
@@ -1169,7 +1027,7 @@ def build_ui():
                             insights_btn = gr.Button("💡 要約と考察を作る", scale=1)
                         doc_status = gr.Markdown()
 
-            # ======================== SRT編集 ========================
+            # ======================== ノイズの見本で補正 ========================
             with gr.Tab("🔈 ノイズの見本で補正"):
                 gr.Markdown("説明者が話しておらず、環境音だけが聞こえる範囲を選びます。"
                             "人のざわめきは声と重なるため、強く消すと発言まで削れることがあります。")
@@ -1188,48 +1046,6 @@ def build_ui():
                 noise_download = gr.File(label="補正音声を保存", interactive=False)
                 gr.Markdown("元音声は変更しません。補正音声で文字起こしする場合は、"
                             "文字起こしタブにこのファイルを指定し、「背景ノイズ除去」をOFFにして二重処理を避けてください。")
-
-            with gr.Tab("🎬 字幕(SRT)編集"):
-                gr.Markdown("単語ごとのタイミングから、読みやすい長さ・区切りで字幕を自動生成します。"
-                            "時刻は `HH:MM:SS,mmm` 形式で直接編集できます。")
-                with gr.Accordion("字幕の分割ルール", open=True):
-                    with gr.Row():
-                        s_chars = gr.Slider(10, 42, value=sub.get("max_chars_line", 20), step=1,
-                                            label="1行の最大文字数")
-                        s_lines = gr.Slider(1, 3, value=sub.get("max_lines", 2), step=1,
-                                            label="最大行数")
-                        s_maxdur = gr.Slider(2, 12, value=sub.get("max_duration", 6.0), step=0.5,
-                                             label="1枚の最大秒数")
-                    with gr.Row():
-                        s_mindur = gr.Slider(0.3, 3, value=sub.get("min_duration", 1.0), step=0.1,
-                                             label="1枚の最小秒数")
-                        s_pause = gr.Slider(0.2, 2, value=sub.get("pause_split", 0.6), step=0.1,
-                                            label="この秒数の無音で切り替え")
-                        with gr.Column():
-                            s_spk = gr.Checkbox(value=sub.get("speaker_prefix", False),
-                                                label="先頭に（話者名）を付ける")
-                            s_period = gr.Checkbox(value=sub.get("drop_period", True),
-                                                   label="句点「。」を消す（字幕の慣習）")
-                    sub_inputs = [s_chars, s_lines, s_maxdur, s_mindur, s_pause, s_spk, s_period]
-                with gr.Row():
-                    srt_regen_btn = gr.Button("🔄 このルールで字幕を作り直す", variant="primary")
-                    srt_import_file = gr.File(label="既存のSRT/VTTを読み込んで編集",
-                                              file_types=[".srt", ".vtt"], type="filepath",
-                                              height=90)
-                srt_editor = gr.Dataframe(
-                    headers=["番号", "開始", "終了", "話者", "テキスト"],
-                    datatype=["number", "str", "str", "str", "str"],
-                    column_count=(5, "fixed"), interactive=True, wrap=True, max_height=560,
-                )
-                with gr.Row():
-                    shift_num = gr.Number(value=0.0, label="ずらす秒数（＋で遅く）", step=0.1,
-                                          scale=1)
-                    shift_btn = gr.Button("⏩ 全体の時刻をずらす", scale=1)
-                    fix_btn = gr.Button("🩺 チェック＆自動修正", scale=1)
-                    learned_btn = gr.Button("📚 人名・学習済み修正を適用", scale=1)
-                srt_status = gr.Markdown()
-                srt_save_btn = gr.Button("💾 SRT / VTT を保存", variant="primary")
-                srt_files = gr.Files(label="保存された字幕ファイル")
 
             # ======================== 人物・声紋 ========================
             with gr.Tab("👤 人物・声紋登録"):
@@ -1353,7 +1169,7 @@ def build_ui():
 
         # ======================== イベント ========================
         view_outputs = [transcript_html, minutes_view, insights_view,
-                        dl_transcript, dl_minutes, dl_srt, speaker_table, edit_table, job_notice]
+                        dl_transcript, dl_minutes, dl_insights, speaker_table, edit_table, job_notice]
 
         noise_preview_btn.click(fn=preview_noise_sample, inputs=[noise_source, noise_start, noise_end],
                                 outputs=noise_sample_player)
@@ -1367,58 +1183,37 @@ def build_ui():
                     meeting_date_box, memo_box, decoding_radio, silence_guard_cb],
             outputs=[result_md, job_state] + view_outputs + [history_dd],
             concurrency_id="asr",
-        ).then(fn=lambda: "", outputs=pause_status, queue=False
-               ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
+        ).then(fn=lambda: "", outputs=pause_status, queue=False)
 
         resume_btn.click(
             fn=resume_transcription,
             inputs=[job_state, files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, eq_cb,
                     fillers_cb, diarize_cb, meeting_date_box, memo_box, decoding_radio, silence_guard_cb],
             outputs=[result_md, job_state] + view_outputs + [history_dd], concurrency_id="asr",
-        ).then(fn=lambda: "", outputs=pause_status, queue=False
-               ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
+        ).then(fn=lambda: "", outputs=pause_status, queue=False)
 
         speed_radio.change(fn=lambda speed: gr.update(interactive=speed != "fast"),
                            inputs=speed_radio, outputs=silence_guard_cb, queue=False)
 
         history_dd.input(fn=open_job, inputs=history_dd,
-                         outputs=[result_md, job_state] + view_outputs
-                         ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
+                         outputs=[result_md, job_state] + view_outputs)
         history_refresh.click(fn=refresh_history, outputs=history_dd)
         rediarize_btn.click(fn=rediarize_job, inputs=[job_state, num_spk_dd],
-                            outputs=[result_md, job_state] + view_outputs
-                            ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
+                            outputs=[result_md, job_state] + view_outputs)
         reflow_btn.click(fn=reflow_job, inputs=job_state,
-                         outputs=[result_md, job_state] + view_outputs
-                         ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
+                         outputs=[result_md, job_state] + view_outputs)
 
         assign_btn.click(fn=assign_speakers, inputs=[speaker_table, save_voice_cb, job_state],
                          outputs=[assign_status, job_state] + view_outputs
-                         ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor
-                                ).then(fn=_voiceprint_rows, outputs=vp_table)
+                         ).then(fn=_voiceprint_rows, outputs=vp_table)
         proofread_btn.click(fn=proofread_job, inputs=[job_state, redo_cb],
-                            outputs=[proofread_status, job_state] + view_outputs
-                            ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
+                            outputs=[proofread_status, job_state] + view_outputs)
         minutes_btn.click(fn=make_minutes, inputs=job_state,
                           outputs=[doc_status, job_state] + view_outputs)
         insights_btn.click(fn=make_insights, inputs=job_state,
                            outputs=[doc_status, job_state] + view_outputs)
         save_edit_btn.click(fn=save_utterance_edits, inputs=[edit_table, job_state],
-                            outputs=[edit_status, job_state] + view_outputs
-                            ).then(fn=load_srt_for_state, inputs=job_state, outputs=srt_editor)
-
-        srt_regen_btn.click(fn=srt_regenerate, inputs=[job_state] + sub_inputs,
-                            outputs=[srt_editor, srt_status])
-        srt_import_file.upload(fn=srt_import, inputs=[srt_import_file] + sub_inputs,
-                               outputs=[srt_editor, srt_status])
-        fix_btn.click(fn=srt_autofix, inputs=[srt_editor] + sub_inputs,
-                      outputs=[srt_editor, srt_status])
-        shift_btn.click(fn=srt_shift, inputs=[srt_editor, shift_num] + sub_inputs,
-                        outputs=[srt_editor, srt_status])
-        learned_btn.click(fn=srt_apply_learned, inputs=[srt_editor] + sub_inputs,
-                          outputs=[srt_editor, srt_status])
-        srt_save_btn.click(fn=srt_save, inputs=[srt_editor, job_state] + sub_inputs,
-                           outputs=[srt_files, srt_status])
+                            outputs=[edit_status, job_state] + view_outputs)
 
         vp_enroll_btn.click(fn=enroll_voice, inputs=[vp_name, vp_audio, vp_file],
                             outputs=[vp_status, vp_table, vp_del_name, people_table, vp_audio, vp_file])
