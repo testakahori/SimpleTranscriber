@@ -49,7 +49,7 @@ def _save_job(job, action="発言の修正", backup=True):
 def _require_saved(state, allow=None):
     dirty = (state or {}).get("_dirty", set())
     if any(kind != allow for kind in dirty):
-        raise gr.Error("未保存の編集があります。「修正を保存」「話者を確定」、または「未保存の編集を破棄」を先に押してください。")
+        raise gr.Error("未保存の編集があります。「修正を保存」「話者名を確定」、または「保存済みの内容に戻す」を先に押してください。")
     if state and not state.get("incomplete"):
         try:
             job_history.ensure_current(state)
@@ -103,7 +103,41 @@ def use_reduced_audio(path, state):
     if not path or not Path(path).is_file():
         raise gr.Error("先にノイズ補正を実行してください。")
     return ([path], False, gr.update(selected="transcribe"),
-            "補正音声をセットしました。背景ノイズ除去はOFFにしました。内容を確認して「文字起こし開始」を押してください。")
+            "補正音声をセットしました。背景ノイズ除去はOFFです。内容を確認して「文字起こしを開始」を押してください。",
+            gr.update(selected="new"))
+
+
+def document_hint(state, filename):
+    if not state:
+        return "音声を文字起こしするか、「保存した会議」を開くと作成できます。"
+    if state.get("incomplete"):
+        return "文字起こしが途中です。「保存した会議」から再開し、全編が完了してから作成してください。"
+    if state.get("_dirty"):
+        return "未保存の編集があります。「修正」で保存してから作成してください。"
+    if not any(u.get("text", "").strip() for u in state.get("utterances", [])):
+        return "発言がないため作成できません。元音声と文字起こし結果を確認してください。"
+    status = document_status.status(state, filename)
+    if status == "stale":
+        return "**本文が更新されています。** 最新の内容で作り直してください。ダウンロードは更新前の文書です。"
+    if status == "unknown":
+        return "この文書の生成元を確認できません。現在の本文から作り直すと、更新状況を確認できます。"
+    if status == "current":
+        return "保存済みの本文から作成した文書です。内容を確認してMarkdownをダウンロードできます。"
+    return ("保存済みの本文から作成します。作成後も聞き取り違いや決定事項を確認してください。"
+            if filename == "議事録.md" else
+            "要約に加え、AIの考察を作成します。考察は発言そのものとは分けて確認してください。")
+
+
+def document_button(state, filename):
+    if state and (Path(state["job_dir"]) / filename).exists():
+        return filename.removesuffix(".md") + "を作り直す"
+    return filename.removesuffix(".md") + "を作成"
+
+
+def pause_button_state(request: gr.Request = None):
+    status = run_control.status(getattr(request, "session_hash", None))
+    return gr.update(interactive=status == "running",
+                     value="保存して停止中…" if status == "pausing" else "一時停止して保存")
 
 
 def workflow_controls(state):
@@ -113,7 +147,7 @@ def workflow_controls(state):
     can_generate = ready and any(u.get("text", "").strip() for u in state.get("utterances", []))
     versions = job_history.choices(state)
     if not state:
-        context = "音声ファイルを選んで開始するか、「過去の結果を開く」から保存済みの会議を選んでください。"
+        context = "**音声の準備 → 本文の確認・修正 → 議事録の作成**"
     else:
         status = "途中保存・全編未完了" if state.get("incomplete") else "文字起こし完了"
         context = (f"**表示中: {Path(state['job_dir']).name}**  \n"
@@ -121,21 +155,24 @@ def workflow_controls(state):
         if complete:
             pending = sum(bool(u.get("proofread_pending")) for u in state["utterances"])
             context += f" ／ AI校正の再確認 {pending}件" if pending else ""
-            context += "  \n本文と話者を確認・保存してから、議事録や要約を作成してください。"
+            context += "  \n本文を聞き直し、「修正」で保存してから議事録や要約を作成してください。"
     return (
-        context, "⚠️ 未保存の編集があります。保存・確定するか、破棄してから次へ進んでください。" if dirty else "",
+        context, "⚠️ 未保存の編集があります。「修正」タブで保存・確定するか、保存済みの内容に戻してください。" if dirty else "",
         gr.update(choices=versions, value=None),
         gr.update(interactive=bool(versions) and ready),  # restore
         gr.update(interactive=complete),  # 競合した古い画面も保存済みの内容へ読み直せる。
         gr.update(interactive=bool(state and state.get("incomplete")) and not dirty),  # resume
         gr.update(interactive=ready and bool(state.get("audio_path")) if state else False),
         gr.update(interactive=ready), gr.update(interactive=can_generate),  # reflow/proofread
-        gr.update(interactive=can_generate), gr.update(interactive=can_generate),  # documents
+        gr.update(interactive=can_generate, value=document_button(state, "議事録.md")),
+        gr.update(interactive=can_generate, value=document_button(state, "要約と考察.md")),
         gr.update(interactive=complete and "text" not in dirty),  # assign
         gr.update(interactive=complete and "speakers" not in dirty),  # save text
         gr.update(interactive=complete and "text" not in dirty),  # speaker table
         gr.update(interactive=complete and "speakers" not in dirty),  # edit table
         gr.update(interactive=not dirty, value=Path(state["job_dir"]).name if state else None),
+        document_hint(state, "議事録.md"), document_hint(state, "要約と考察.md"),
+        gr.update(interactive=complete),  # 本文から修正への移動
     )
 
 
@@ -234,8 +271,24 @@ def _read_md(job: dict, name: str) -> str:
     path = Path(job["job_dir"]) / name
     if not path.exists():
         return ""
-    warning = document_status.warning(job, name)
-    return (warning + "\n\n---\n\n" if warning else "") + path.read_text(encoding="utf-8")
+    # 文書の更新状態はタブ上部の案内にまとめ、本文内で同じ警告を繰り返さない。
+    return path.read_text(encoding="utf-8")
+
+
+def _job_notice(job):
+    if job.get("incomplete"):
+        return checkpoints.notice(job)
+    groups = {"stale": [], "unknown": []}
+    for name in document_status.DOCUMENTS:
+        status = document_status.status(job, name)
+        if status in groups:
+            groups[status].append(Path(name).stem)
+    notices = []
+    if groups["stale"]:
+        notices.append("⚠️ 更新前の文書: " + "・".join(groups["stale"]) + "。各タブから作り直せます。")
+    if groups["unknown"]:
+        notices.append("⚠️ 更新状況を確認できない文書: " + "・".join(groups["unknown"]) + "。各タブで確認してください。")
+    return "\n\n".join(notices)
 
 
 
@@ -284,15 +337,14 @@ def _job_views(job: dict):
         job.setdefault("_revision", job_history.revision(Path(job["job_dir"])))
     return (
         U.render_html(job["utterances"], _file_url(job.get("audio_path"))),
-        _read_md(job, "議事録.md") or "_議事録はまだありません（文字起こしを確認・修正してから「③ 📋 議事録を作る」を押してください）_",
-        _read_md(job, "要約と考察.md") or "_要約と考察はまだありません（「💡 要約と考察を作る」で作成）_",
+        _read_md(job, "議事録.md") or "まだ議事録はありません。",
+        _read_md(job, "要約と考察.md") or "まだ要約と考察はありません。",
         _download_transcript(job),
         _download(job, "議事録.md"),
         _download(job, "要約と考察.md"),
         gr.update(value=_speaker_rows(job), interactive=not job.get("incomplete", False)),
         gr.update(value=_edit_rows(job), interactive=not job.get("incomplete", False)),
-        "\n\n".join(filter(None, [checkpoints.notice(job)] +
-                            [document_status.warning(job, name) for name in document_status.DOCUMENTS])),
+        _job_notice(job),
     )
 
 
@@ -348,7 +400,7 @@ def _run_asr(target, *args, settings, progress, request):
 
 def _paused_message(job):
     return (f"⏸ **{job['source']}** の途中結果と再開用音声を保存して一時停止しました。"
-            "「▶ 途中保存から再開」で続行できます。アプリを閉じた場合も、履歴から開いて再開できます。")
+            "「途中保存から再開」で続行できます。アプリを閉じた場合も、履歴から開いて再開できます。")
 
 
 def resume_transcription(state, files, model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on,
@@ -445,12 +497,12 @@ def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fi
         if remaining:
             lines.append("未着手のファイルは、あとで選び直して開始してください: " + "、".join(remaining))
     if failures:
-        lines.append("認識済みの途中保存がある場合は「📂 過去の結果を開く」から確認できます。"
+        lines.append("認識済みの途中保存がある場合は「保存した会議」から確認できます。"
                      "アプリを再起動しても残ります。")
     if jobs and not paused_batch:
         lines.append("**次は ② 確認・修正**: 右の文字起こしを見て、話者名と内容を直してください"
-                     "（「✍️ AI校正」で誤変換をAIに直させることもできます）。"
-                     "直し終わったら「③ 📋 議事録を作る」。")
+                     "（「AI校正を実行」で誤変換をAIに直させることもできます）。"
+                     "直し終わったら「議事録」タブの作成ボタン。")
     summary = "\n\n".join(lines)
 
     if not jobs and not paused_job:
@@ -509,7 +561,7 @@ def rediarize_job(state, num_speakers, progress=gr.Progress()):
            + (f"\n\n🔊 声紋で自動認識: " + "、".join(f"{k}（{v:.2f}）" for k, v in matched.items())
               if matched else "")
            + "\n\nAI校正・手修正した本文は保持しました。修正済みの発言内で複数の声がある場合は、長く話した人を割り当てています。"
-             "議事録に反映するには「③ 📋 議事録を作る」を押してください。")
+             "議事録に反映するには「議事録」タブの作成ボタンを押してください。")
     return (msg, job) + _job_views(job)
 
 
@@ -530,7 +582,7 @@ def reflow_job(state):
         return (f"⚠️ この結果は {edited} 件の発言がAI校正または手修正されています。"
                 "整え直すと文字は音声認識の結果に戻り、それらの修正は消えます。"
                 "\n\nそれでもよければ、もう一度ボタンを押してください"
-                "（おすすめ: 先に整え直してから「✍️ AI校正」をかける）。",
+                "（おすすめ: 先に整え直してから「AI校正を実行」をかける）。",
                 job) + none
     job.pop("_reflow_confirm", None)
     settings = config.load_settings()
@@ -542,7 +594,7 @@ def reflow_job(state):
     _save_job(job, "文の区切りの整形")
     msg = (f"✅ 文の区切り・句読点を整え直しました（{before} 行 → {len(U.sentence_rows(utts))} 行）"
            "\n\n※ 文字は音声認識の結果から作り直しました（AI校正・手修正は反映されていません）。"
-           "議事録に反映するには「③ 📋 議事録を作る」を押してください。")
+           "議事録に反映するには「議事録」タブの作成ボタンを押してください。")
     return (msg, job) + _job_views(job)
 
 
@@ -632,7 +684,7 @@ def proofread_job(state, redo, progress=gr.Progress()):
     notice = llm.pop_fallback_notice()
     if notice:
         msg += f"\n\n⚠️ {notice}"
-    msg += "\n\n直し終わったら「③ 📋 議事録を作る」を押してください。"
+    msg += "\n\n直し終わったら「議事録」タブの作成ボタンを押してください。"
     return (msg, job) + _job_views(job)
 
 
@@ -660,7 +712,7 @@ def _make_doc(state, kind: str, progress):
         if not md or not md.strip():
             raise llm.LLMError("AIから本文が返りませんでした。以前の文書は保持しています。")
         document_status.save(Path(job["job_dir"]), filename, md, source)
-        msg = f"✅ {label}を作りました（上の「{label}」タブで確認・📥 からダウンロード）"
+        msg = f"✅ {label}を作成して保存しました。内容を確認してMarkdownをダウンロードできます。"
     except (llm.LLMError, OSError) as e:
         msg = f"⚠️ {label}を作れませんでした: {e}"
     notice = llm.pop_fallback_notice()
@@ -737,7 +789,7 @@ def assign_speakers(rows, save_voice, state):
         msg += "\n\n⚠️ 人物辞書・声紋の更新は完了しませんでした。話者名は保存済みです。"
     if learned:
         msg += f"\n\n{learned}"
-    msg += "\n\n議事録に反映するには「③ 📋 議事録を作る」を押してください。"
+    msg += "\n\n議事録に反映するには「議事録」タブの作成ボタンを押してください。"
     return (msg, job) + _job_views(job)
 
 
@@ -758,9 +810,9 @@ def save_utterance_edits(rows, state):
                 raise ValueError()
             idx = int(number) - 1
         except (ValueError, OverflowError):
-            raise gr.Error("行番号が不正です。保存せずに止めました。未保存の編集を破棄して開き直してください。")
+            raise gr.Error("行番号が不正です。保存せずに止めました。「保存済みの内容に戻す」で開き直してください。")
         if not (0 <= idx < len(utts)) or idx in seen:
-            raise gr.Error("行番号の重複・範囲外を検出したため保存しません。未保存の編集を破棄して開き直してください。")
+            raise gr.Error("行番号の重複・範囲外を検出したため保存しません。「保存済みの内容に戻す」で開き直してください。")
         seen.add(idx)
         u = dict(utts[idx])
         old_sp, old_text = shown[idx] if idx < len(shown) else (u.get("speaker", ""), u["text"])
@@ -883,7 +935,11 @@ def save_people_table(rows):
 
 def do_search(query):
     rows = search_mod.search_outputs(query)
-    return rows or [["", "", "", "該当なし"]]
+    if not (query or "").strip():
+        return [], "検索する言葉を入力してください。"
+    if not rows:
+        return [], "一致する結果はありません。言葉を短くするか、別の表記で検索してください。"
+    return rows, f"{len(rows)}件見つかりました。行を選ぶと、その会議を開きます。"
 
 
 def refresh_jobs(state=None):
@@ -994,9 +1050,37 @@ def test_llm():
 # =====================================================================
 
 CSS = """
-.gradio-container{max-width:1500px !important}
+.gradio-container{max-width:1500px !important;font-size:15px}
+.gradio-container{--body-text-color-subdued:#526071 !important;--block-info-text-color:#526071 !important;
+  --button-primary-background-fill:#b45309 !important;--button-primary-background-fill-hover:#92400e !important;
+  --button-primary-text-color:#fff !important;--button-primary-border-color:#b45309 !important}
+.dark .gradio-container,.gradio-container.dark{--body-text-color-subdued:#cbd5e1 !important;--block-info-text-color:#cbd5e1 !important}
+#st-main-tabs [role=tab][aria-selected=true]{color:#9a3d06;border-bottom-color:#9a3d06}
+.dark #st-main-tabs [role=tab][aria-selected=true]{color:#fdba74;border-bottom-color:#fdba74}
+#st-title h1{font-size:25px;line-height:1.4;margin-bottom:0}
+.st-subtitle p{margin-top:0;color:var(--body-text-color-subdued)}
+#st-workspace{gap:24px}
+#st-source-panel,#st-result-panel{min-width:0}
+#st-current-job{padding:14px 16px;background:var(--background-fill-secondary);border-radius:8px}
+#st-current-job p{margin:0;line-height:1.75;overflow-wrap:anywhere}
+#st-draft-status:not(:empty),#st-job-notice:not(:empty){line-height:1.7}
+#st-draft-status:has(.md:empty),#st-job-notice:has(.md:empty){display:none}
+#st-draft-status p{padding:10px 14px;border-left:4px solid #b45309;background:var(--background-fill-secondary)}
 #st-summary p{margin:.2em 0}
-.st-dl button{min-width:0}
+.st-toolbar{gap:10px}
+.st-toolbar button{min-width:120px;min-height:40px}
+.st-help p{font-size:13px;line-height:1.65;color:var(--body-text-color-subdued)}
+.st-empty{padding:64px 20px;text-align:center;border:1px dashed var(--border-color-primary);border-radius:8px}
+.st-empty strong{font-size:18px}
+.st-empty p{color:var(--body-text-color-subdued);line-height:1.8}
+.st-document{line-height:1.9;padding:8px 4px;overflow-wrap:anywhere}
+#st-result-panel button:focus-visible,#st-source-panel button:focus-visible{outline:2px solid #a74608;outline-offset:3px}
+@media(max-width:850px){
+  #st-workspace{flex-direction:column;gap:16px}
+  #st-source-panel,#st-result-panel{width:100%}
+  #st-title h1{font-size:21px}
+  .st-empty{padding:32px 16px}
+}
 """
 
 
@@ -1036,156 +1120,164 @@ def build_ui():
         _probe_thread.start()
 
     with gr.Blocks(title="つよつよ文字起こし＆議事録ツール") as demo:
-        gr.Markdown("# 🎙️ つよつよ文字起こし＆議事録ツール")
-        status_md = gr.Markdown("文字起こし: 確認中… ／ 話者識別: 確認中…")
-
+        gr.Markdown("# つよつよ文字起こし＆議事録ツール", elem_id="st-title")
+        gr.Markdown("音声を文字に。確認した内容を、議事録に。", elem_classes="st-subtitle")
         job_state = gr.State(None)
 
-        with gr.Tabs() as main_tabs:
+        with gr.Tabs(elem_id="st-main-tabs") as main_tabs:
             # ======================== 文字起こし ========================
-            with gr.Tab("🎙️ 文字起こし", id="transcribe"):
-                with gr.Row(equal_height=False):
-                    with gr.Column(scale=4, min_width=320):
-                        files_input = gr.File(
-                            label="音声・動画ファイル（複数まとめてドロップ可）",
-                            file_count="multiple", file_types=FILE_TYPES, type="filepath",
-                        )
-                        with gr.Row():
-                            num_spk_dd = gr.Dropdown(
-                                SPEAKER_COUNT_CHOICES, value=0, label="話者の人数",
-                                info="分かっていれば指定すると精度UP",
-                            )
-                            model_dd = gr.Dropdown(
-                                transcriber.MODEL_CHOICES, value=settings["whisper"]["model"],
-                                label="認識モデル", info="auto = GPUならlarge-v3（最高精度）",
-                            )
-                        speed_radio = gr.Radio(
-                            transcriber.SPEED_CHOICES, value=settings["whisper"].get("speed", "accurate"),
-                            label="文字起こしの速さ",
-                            info="4時間の録音の目安: 精度優先 約1時間／バランス 約25分／高速 約8分")
-                        meeting_date_box = gr.Textbox(
-                            label="会議日時（任意）", placeholder="例: 2026年9月17日 10:00",
-                            info="空欄ならファイル名から推定")
-                        memo_box = gr.Textbox(
-                            label="会議メモ（任意・議事録AIへのヒント）", lines=2,
-                            placeholder="例: 清風学園との定例。参加者は坪内、岡田、平岡…")
-                        with gr.Accordion("詳細オプション", open=False):
-                            decoding_radio = gr.Radio(
-                                transcriber.DECODING_CHOICES,
-                                value=settings["whisper"].get("decoding", "stable"),
-                                label="認識方式",
-                                info="推奨方式は前の誤認識を引きずりにくくします。人名・用語の表記が崩れる録音では"
-                                     "従来方式も試せます。高速モードではこの選択は使いません。")
-                            silence_guard_cb = gr.Checkbox(
-                                value=settings["whisper"].get("silence_guard", True),
-                                interactive=settings["whisper"].get("speed", "accurate") != "fast",
-                                label="無音付近の誤認識を除外（内部スキップ）",
-                                info="ONは従来の動作。雑音で処理が進まないときはOFFを試してください（全編実験の設定）。"
-                                     "OFFでは誤った文が残ることがあります。高速モードには適用しません。")
-                            lang_dd = gr.Dropdown(
-                                ["ja", "auto"], value=settings["whisper"]["language"],
-                                label="言語", info="ja=日本語固定（推奨）")
-                            eq_cb = gr.Checkbox(
-                                value=settings["audio"]["asr_eq"],
-                                label="音質補正（低音のうなり・高域ノイズをカット／推奨）")
-                            noise_cb = gr.Checkbox(
-                                value=settings["audio"]["noise_reduction"],
-                                label="背景ノイズ除去（空調・雑音を弱めに除去／推奨）")
-                            fillers_cb = gr.Checkbox(
-                                value=settings["postprocess"]["remove_fillers"],
-                                label="フィラー除去（「えー」「えーっと」「うーん」などを消す）")
-                            diarize_cb = gr.Checkbox(
-                                value=dia_available, interactive=dia_available,
-                                label="話者識別・声紋照合" + ("" if dia_available else "（未導入）"))
-                        start_btn = gr.Button("① 🚀 文字起こし開始", variant="primary", size="lg")
-                        pause_btn = gr.Button("⏸ 一時停止（保存して止める）", size="sm")
+            with gr.Tab("文字起こし", id="transcribe"):
+                with gr.Row(equal_height=False, elem_id="st-workspace"):
+                    with gr.Column(scale=3, min_width=290, elem_id="st-source-panel"):
+                        with gr.Tabs() as source_tabs:
+                            with gr.Tab("新しく文字起こし", id="new"):
+                                files_input = gr.File(
+                                    label="音声・動画ファイル", height=150,
+                                    file_count="multiple", file_types=FILE_TYPES, type="filepath",
+                                )
+                                speed_radio = gr.Radio(
+                                    [("精度優先", "accurate"), ("バランス", "balanced"), ("高速", "fast")],
+                                    value=settings["whisper"].get("speed", "accurate"),
+                                    label="文字起こしの速さ",
+                                    info="迷ったら精度優先。高速は発言の取りこぼしが増える場合があります。")
+                                start_btn = gr.Button("文字起こしを開始", variant="primary", size="lg", interactive=False)
+                                gr.Markdown("複数ファイルは順に処理します。結果はこのPCに自動保存されます。",
+                                            elem_classes="st-help")
+                                with gr.Accordion("会議情報・認識の設定", open=False):
+                                    meeting_date_box = gr.Textbox(
+                                        label="会議日時（任意）", placeholder="例: 2026年10月20日 10:00",
+                                        info="空欄ならファイル名から推定")
+                                    memo_box = gr.Textbox(
+                                        label="会議メモ（任意）", lines=2,
+                                        placeholder="議題・参加者・議事録に残したい背景など")
+                                    num_spk_dd = gr.Dropdown(
+                                        SPEAKER_COUNT_CHOICES, value=0, label="話者の人数",
+                                        info="分かっていれば指定。分からなければ自動のままで使えます。")
+                                    model_dd = gr.Dropdown(
+                                        transcriber.MODEL_CHOICES, value=settings["whisper"]["model"],
+                                        label="認識モデル", info="auto: このPCに合うモデルを自動選択")
+                                    decoding_radio = gr.Radio(
+                                        transcriber.DECODING_CHOICES,
+                                        value=settings["whisper"].get("decoding", "stable"),
+                                        label="認識方式",
+                                        info="通常は推奨方式。人名・用語の表記が崩れる場合は従来方式も試せます。高速では使いません。")
+                                    silence_guard_cb = gr.Checkbox(
+                                        value=settings["whisper"].get("silence_guard", True),
+                                        interactive=settings["whisper"].get("speed", "accurate") != "fast",
+                                        label="無音付近の誤認識を除外（内部スキップ）",
+                                        info="雑音で処理が進まない場合はOFFを試してください。OFFでは誤った文が残る場合があります。")
+                                    lang_dd = gr.Dropdown(
+                                        [("日本語", "ja"), ("自動判定", "auto")],
+                                        value=settings["whisper"]["language"], label="言語")
+                                    eq_cb = gr.Checkbox(value=settings["audio"]["asr_eq"],
+                                                       label="音質補正（低音・高域ノイズを軽減）")
+                                    noise_cb = gr.Checkbox(value=settings["audio"]["noise_reduction"],
+                                                          label="背景ノイズ除去（空調・雑音を軽減）")
+                                    fillers_cb = gr.Checkbox(value=settings["postprocess"]["remove_fillers"],
+                                                            label="「えー」「うーん」などを除く")
+                                    diarize_cb = gr.Checkbox(
+                                        value=dia_available, interactive=dia_available,
+                                        label="話者識別・声紋照合" + ("" if dia_available else "（未導入）"))
+                            with gr.Tab("保存した会議", id="history"):
+                                gr.Markdown("会議を選ぶと、本文・修正履歴・議事録を開けます。")
+                                history_dd = gr.Dropdown(
+                                    label="会議を選択", choices=output.list_editable_jobs(), value=None)
+                                history_refresh = gr.Button("一覧を更新", size="sm")
+                                resume_btn = gr.Button("途中保存から再開", variant="primary", interactive=False)
+                                gr.Markdown("途中保存の会議は、保存時の音声・設定で続きを処理します。"
+                                            "本文の編集は全編の完了後に行えます。", elem_classes="st-help")
+                        pause_btn = gr.Button("一時停止して保存", size="sm", interactive=False)
+                        pause_timer = gr.Timer(2)
                         pause_status = gr.Markdown(elem_id="st-pause-status")
-                        gr.Markdown("<small>①は音声の文字起こしと話者識別だけを行います。"
-                                    "一時停止は処理中の区間が終わってから保存して止めます。"
-                                    "認識中は途中保存し、停止した場合は履歴から開いて続きを再開できます。"
-                                    "AI校正（②）と議事録（③）は、確認・修正のあと右側のボタンで別に実行します。</small>")
                         result_md = gr.Markdown(elem_id="st-summary")
-                        with gr.Row():
-                            history_dd = gr.Dropdown(
-                                label="📂 過去の結果を開く", choices=output.list_editable_jobs(),
-                                value=None, scale=4)
-                            history_refresh = gr.Button("🔄", scale=1, min_width=40)
-                        resume_btn = gr.Button("▶ 途中保存から再開", size="sm", interactive=False)
-                        gr.Markdown("<small>履歴から途中保存を開いて再開します。保存時の音声・設定を使うため、"
-                                    "新しい形式の結果はファイルの再選択が不要です。境界付近だけ聞き直します。</small>")
-                        rediarize_btn = gr.Button("👥 話者識別だけやり直す（上の「話者の人数」を使用）",
-                                                  size="sm", interactive=False)
-                        reflow_btn = gr.Button("✂️ 文の区切り・句読点を整え直す（数秒・音声解析なし）",
-                                               size="sm", interactive=False)
+                        with gr.Accordion("操作のヒント", open=False):
+                            gr.Markdown("1. 音声を選んで文字起こしを開始\n"
+                                        "2. 本文を聞き直し、「修正」で保存\n"
+                                        "3. 「議事録」「要約と考察」で作成・ダウンロード\n\n"
+                                        "一時停止は、処理中の区間が終わってから保存して止まります。")
 
-                    with gr.Column(scale=7):
+                    with gr.Column(scale=7, min_width=320, elem_id="st-result-panel"):
                         current_job = gr.Markdown(workflow_controls(None)[0], elem_id="st-current-job")
                         job_notice = gr.Markdown(elem_id="st-job-notice")
                         draft_status = gr.Markdown(elem_id="st-draft-status")
-                        with gr.Row(elem_classes="st-dl"):
-                            dl_transcript = gr.DownloadButton("📥 文字起こし.md", interactive=False,
-                                                              variant="primary")
-                            dl_minutes = gr.DownloadButton("📥 議事録.md", interactive=False)
-                            dl_insights = gr.DownloadButton("📥 要約と考察.md", interactive=False)
-                        with gr.Tabs() as result_tabs:
-                            with gr.Tab("📜 文字起こし", id="transcript"):
-                                # Gradio 6.6のHTMLは連続更新時に古いDOMが残る。MarkdownのHTML表示を使う。
-                                # 本文・話者・音声URLはU.render_htmlがエスケープする。時刻クリックは残す。
+                        with gr.Tabs(elem_id="st-result-tabs") as result_tabs:
+                            with gr.Tab("本文", id="transcript"):
+                                with gr.Row(elem_classes="st-toolbar"):
+                                    review_jump_btn = gr.Button("修正へ進む", interactive=False)
+                                    dl_transcript = gr.DownloadButton("文字起こし.md", interactive=False)
+                                # Gradio 6.6のHTMLは連続更新時に古いDOMが残る。安全に整形したHTMLをMarkdownで表示する。
                                 transcript_html = gr.Markdown(
-                                    '<div style="padding:40px;text-align:center;opacity:.6">'
-                                    "ここに「時刻・話者・発言」が表示されます</div>",
+                                    '<div class="st-empty"><strong>ここに文字起こしが表示されます</strong>'
+                                    '<p>音声を選んで開始するか、「保存した会議」を開いてください。</p>'
+                                    '<p>完了後は、時刻を押して聞き直しながら確認できます。</p></div>',
                                     sanitize_html=False, latex_delimiters=[])
-                            with gr.Tab("📋 議事録", id="minutes"):
-                                minutes_view = gr.Markdown()
-                            with gr.Tab("💡 要約と考察", id="insights"):
-                                insights_view = gr.Markdown()
-
-                        gr.Markdown("### ② 確認・修正")
-                        with gr.Accordion("👥 話者に名前を付ける（声紋を覚えて次回から自動認識）", open=True):
-                            gr.Markdown("「名前」列に正式な名前を入力 → 確定。"
-                                        "登録済み人物は自動で名前が付いています。")
-                            speaker_table = gr.Dataframe(
-                                headers=["今の表示", "名前"], datatype=["str", "str"],
-                                column_count=(2, "fixed"), interactive=False, static_columns=[0],
-                            )
-                            with gr.Row():
-                                save_voice_cb = gr.Checkbox(value=True, label="声紋として保存する")
-                                assign_btn = gr.Button("✅ 話者を確定", variant="primary", interactive=False)
-                            assign_status = gr.Markdown()
-
-                        with gr.Accordion("✏️ 発言を修正（直した言葉は学習して次回から自動で直ります）",
-                                          open=False):
-                            gr.Markdown("話者・内容のセルを直接編集して保存。内容を空にするとその発言を削除します。")
-                            edit_table = gr.Dataframe(
-                                headers=["No", "時刻", "話者", "内容"],
-                                datatype=["number", "str", "str", "str"],
-                                column_count=(4, "fixed"), interactive=False, wrap=True, static_columns=[0, 1],
-                                max_height=500,
-                            )
-                            save_edit_btn = gr.Button("💾 修正を保存して学習", variant="primary", interactive=False)
-                            edit_status = gr.Markdown()
-                        with gr.Accordion("編集を取り消す・以前の本文に戻す", open=False):
-                            discard_btn = gr.Button("未保存の編集を破棄", interactive=False)
-                            gr.Markdown("保存・AI校正・整形の前の本文と話者を復元できます。"
-                                        "人物辞書・修正学習・声紋は戻りません。")
-                            version_dd = gr.Dropdown(label="戻したい編集履歴", choices=[], value=None)
-                            restore_btn = gr.Button("選んだ履歴の本文・話者に戻す", interactive=False)
-                            restore_status = gr.Markdown()
-                        with gr.Row():
-                            proofread_btn = gr.Button("✍️ AI校正（誤変換を文脈で直す・途中からでも再開できる）",
-                                                      scale=3, interactive=False)
-                            redo_cb = gr.Checkbox(value=False, label="校正済みもやり直す", scale=1)
-                        proofread_status = gr.Markdown()
-
-                        gr.Markdown("### ③ 議事録")
-                        gr.Markdown("<small>②で直した今の文字起こしから、`議事録テンプレート.md` の形で作ります。</small>")
-                        with gr.Row():
-                            minutes_btn = gr.Button("📋 議事録を作る", variant="primary", scale=2, interactive=False)
-                            insights_btn = gr.Button("💡 要約と考察を作る", scale=1, interactive=False)
-                        doc_status = gr.Markdown()
+                            with gr.Tab("修正", id="edit"):
+                                with gr.Row(elem_classes="st-toolbar"):
+                                    save_edit_btn = gr.Button("修正を保存", variant="primary", interactive=False)
+                                    discard_btn = gr.Button("保存済みの内容に戻す", interactive=False)
+                                edit_status = gr.Markdown()
+                                gr.Markdown("話者・内容を編集して保存してください。内容を空にすると、その発言を削除します。",
+                                            elem_classes="st-help")
+                                edit_table = gr.Dataframe(
+                                    headers=["No", "時刻", "話者", "内容"],
+                                    datatype=["number", "str", "str", "str"],
+                                    column_count=(4, "fixed"), interactive=False, wrap=True,
+                                    static_columns=[0, 1], column_widths=["56px", "92px", "110px", "65%"],
+                                    max_height=430, elem_id="st-edit-table", buttons=["fullscreen"],
+                                )
+                                gr.Markdown("同じ言い間違いを繰り返し修正すると、次回からの変換に学習されます。",
+                                            elem_classes="st-help")
+                                with gr.Accordion("話者に名前を付ける", open=False):
+                                    gr.Markdown("「名前」列に正式な名前を入力して確定します。")
+                                    speaker_table = gr.Dataframe(
+                                        headers=["今の表示", "名前"], datatype=["str", "str"],
+                                        column_count=(2, "fixed"), interactive=False, static_columns=[0],
+                                        column_widths=["40%", "60%"], wrap=True,
+                                    )
+                                    with gr.Row():
+                                        save_voice_cb = gr.Checkbox(value=True, label="声紋を覚えて次回に使う")
+                                        assign_btn = gr.Button("話者名を確定", interactive=False)
+                                    assign_status = gr.Markdown()
+                                with gr.Accordion("AIに誤変換を見直してもらう", open=False):
+                                    gr.Markdown("文脈から誤変換を校正します。人が修正・保存した本文は保持します。"
+                                                "AIの推測は本文の「要確認」から聞き直してください。")
+                                    with gr.Row():
+                                        proofread_btn = gr.Button("AI校正を実行", interactive=False)
+                                        redo_cb = gr.Checkbox(value=False, label="校正済みもやり直す")
+                                    proofread_status = gr.Markdown()
+                                with gr.Accordion("編集履歴から復元", open=False):
+                                    gr.Markdown("保存・AI校正・整形の前の本文と話者に戻せます。"
+                                                "人物辞書・修正学習・声紋は戻りません。")
+                                    version_dd = gr.Dropdown(label="戻したい編集履歴", choices=[], value=None)
+                                    restore_btn = gr.Button("この履歴に戻す", interactive=False)
+                                restore_status = gr.Markdown()
+                                with gr.Accordion("話者識別・文の区切りをやり直す", open=False):
+                                    rediarize_count_dd = gr.Dropdown(SPEAKER_COUNT_CHOICES, value=0,
+                                                                    label="話者の人数（再識別用）")
+                                    rediarize_btn = gr.Button("話者識別をやり直す", interactive=False)
+                                    gr.Markdown("話者の再識別では修正済みの本文を保持します。"
+                                                "文の整形は元の認識結果から組み直すため、修正済みの場合は再確認します。",
+                                                elem_classes="st-help")
+                                    reflow_btn = gr.Button("文の区切り・句読点を整え直す", interactive=False)
+                            with gr.Tab("議事録", id="minutes"):
+                                minutes_hint = gr.Markdown(document_hint(None, "議事録.md"))
+                                with gr.Row(elem_classes="st-toolbar"):
+                                    minutes_btn = gr.Button("議事録を作成", variant="primary", interactive=False)
+                                    dl_minutes = gr.DownloadButton("議事録.md", interactive=False)
+                                minutes_status = gr.Markdown()
+                                minutes_view = gr.Markdown("まだ議事録はありません。本文を確認してから作成してください。",
+                                                           elem_classes="st-document")
+                            with gr.Tab("要約と考察", id="insights"):
+                                insights_hint = gr.Markdown(document_hint(None, "要約と考察.md"))
+                                with gr.Row(elem_classes="st-toolbar"):
+                                    insights_btn = gr.Button("要約と考察を作成", variant="primary", interactive=False)
+                                    dl_insights = gr.DownloadButton("要約と考察.md", interactive=False)
+                                insights_status = gr.Markdown()
+                                insights_view = gr.Markdown("まだ要約と考察はありません。本文を確認してから作成してください。",
+                                                            elem_classes="st-document")
 
             # ======================== ノイズの見本で補正 ========================
-            with gr.Tab("🔈 ノイズの見本で補正"):
+            with gr.Tab("ノイズ補正"):
                 gr.Markdown("説明者が話しておらず、環境音だけが聞こえる範囲を選びます。"
                             "人のざわめきは声と重なるため、強く消すと発言まで削れることがあります。")
                 noise_source = gr.Audio(label="元音声（再生して範囲を確認）", sources=["upload"], type="filepath")
@@ -1206,7 +1298,7 @@ def build_ui():
                             "上のボタンで文字起こしタブに渡すと「背景ノイズ除去」を自動でOFFにします。")
 
             # ======================== 人物・声紋 ========================
-            with gr.Tab("👤 人物・声紋登録"):
+            with gr.Tab("人物・声紋"):
                 with gr.Row(equal_height=False):
                     with gr.Column(scale=1):
                         gr.Markdown("## 🎤 声紋を登録")
@@ -1245,17 +1337,18 @@ def build_ui():
                 people_status = gr.Markdown()
 
             # ======================== 検索 ========================
-            with gr.Tab("🔍 検索"):
+            with gr.Tab("検索"):
                 gr.Markdown("過去の全議事録・文字起こし・要約を横断検索します（スペース区切りでAND検索）。")
                 gr.Markdown("結果の行を選ぶと、その会議の本文・議事録・要約を開きます。")
                 with gr.Row():
                     search_box = gr.Textbox(label="キーワード", placeholder="例: 見積 坪内", scale=4)
                     search_btn = gr.Button("検索", variant="primary", scale=1)
+                search_status = gr.Markdown("会議の内容に含まれる言葉を入力してください。")
                 search_results = gr.Dataframe(headers=["フォルダ", "ファイル", "行", "内容"],
                                               interactive=False, wrap=True)
 
             # ======================== Word/PDF ========================
-            with gr.Tab("📄 Word/PDF出力") as export_tab:
+            with gr.Tab("Word / PDF") as export_tab:
                 gr.Markdown("生成済みのMarkdownを提出用の Word / PDF に変換します（赤字も維持されます）。")
                 with gr.Row():
                     job_dd = gr.Dropdown(label="出力フォルダ", choices=[], scale=3)
@@ -1269,7 +1362,7 @@ def build_ui():
                 export_files = gr.Files(label="生成ファイル")
 
             # ======================== 用語辞書 ========================
-            with gr.Tab("📚 用語辞書"):
+            with gr.Tab("用語辞書"):
                 gr.Markdown("社名・製品名・専門用語を1行1語で登録すると、音声認識とAI校正の精度が上がります。")
                 glossary_box = gr.Textbox(lines=10, label="用語（1行1語）",
                                           value="\n".join(glossary.load_glossary()))
@@ -1284,7 +1377,9 @@ def build_ui():
                 corrections_status = gr.Markdown()
 
             # ======================== 設定 ========================
-            with gr.Tab("⚙️ 設定"):
+            with gr.Tab("設定"):
+                with gr.Accordion("このPCの動作環境", open=True):
+                    status_md = gr.Markdown("文字起こし: 確認中… ／ 話者識別: 確認中…")
                 gr.Markdown("## LLM（校正・議事録・要約の頭脳）")
                 gr.Markdown("Ollama 上の gemma4 だけで動きます（完全ローカル・文字起こしは外部に送りません）。")
                 with gr.Group():
@@ -1331,7 +1426,11 @@ def build_ui():
                         dl_transcript, dl_minutes, dl_insights, speaker_table, edit_table, job_notice]
         control_outputs = [current_job, draft_status, version_dd, restore_btn, discard_btn,
                            resume_btn, rediarize_btn, reflow_btn, proofread_btn, minutes_btn, insights_btn,
-                           assign_btn, save_edit_btn, speaker_table, edit_table, history_dd]
+                           assign_btn, save_edit_btn, speaker_table, edit_table, history_dd,
+                           minutes_hint, insights_hint, review_jump_btn]
+        feedback_outputs = [edit_status, assign_status, proofread_status, restore_status,
+                            minutes_status, insights_status]
+        clear_feedback = lambda: tuple("" for _ in feedback_outputs)
         job_state.change(fn=workflow_controls, inputs=job_state, outputs=control_outputs,
                          queue=False, show_progress="hidden", show_progress_on=[])
         edit_table.input(fn=lambda state: mark_unsaved(state, "text"), inputs=job_state,
@@ -1343,7 +1442,7 @@ def build_ui():
         restore_btn.click(fn=restore_edits, inputs=[job_state, version_dd],
                           outputs=[restore_status, job_state] + view_outputs, concurrency_id="asr")
         noise_use_btn.click(fn=use_reduced_audio, inputs=[noise_reduced, job_state],
-                            outputs=[files_input, noise_cb, main_tabs, result_md],
+                            outputs=[files_input, noise_cb, main_tabs, result_md, source_tabs],
                             concurrency_id="asr", show_progress="hidden", show_progress_on=[])
 
         noise_preview_btn.click(fn=preview_noise_sample, inputs=[noise_source, noise_start, noise_end],
@@ -1352,28 +1451,38 @@ def build_ui():
                               outputs=[noise_status, noise_reduced, noise_removed, noise_download], concurrency_id="asr")
 
         pause_btn.click(fn=pause_transcription, outputs=pause_status, queue=False)
+        files_input.change(fn=lambda files: gr.update(interactive=bool(files)), inputs=files_input,
+                           outputs=start_btn, queue=False, show_progress="hidden", show_progress_on=[])
+        pause_timer.tick(fn=pause_button_state, outputs=pause_btn, queue=False,
+                         show_progress="hidden", show_progress_on=[])
+        review_jump_btn.click(fn=lambda: gr.update(selected="edit"), outputs=result_tabs, queue=False,
+                              show_progress="hidden", show_progress_on=[])
         start_btn.click(
             fn=run_batch,
             inputs=[files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, eq_cb, fillers_cb, diarize_cb,
                     meeting_date_box, memo_box, decoding_radio, silence_guard_cb, job_state],
             outputs=[result_md, job_state] + view_outputs + [history_dd],
             concurrency_id="asr",
-        ).then(fn=lambda: "", outputs=pause_status, queue=False)
+        ).then(fn=lambda: ("",) + clear_feedback(), outputs=[pause_status] + feedback_outputs,
+               queue=False, show_progress="hidden", show_progress_on=[])
 
         resume_btn.click(
             fn=resume_transcription,
             inputs=[job_state, files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, eq_cb,
                     fillers_cb, diarize_cb, meeting_date_box, memo_box, decoding_radio, silence_guard_cb, job_state],
             outputs=[result_md, job_state] + view_outputs + [history_dd], concurrency_id="asr",
-        ).then(fn=lambda: "", outputs=pause_status, queue=False)
+        ).then(fn=lambda: ("",) + clear_feedback(), outputs=[pause_status] + feedback_outputs,
+               queue=False, show_progress="hidden", show_progress_on=[])
 
         speed_radio.change(fn=lambda speed: gr.update(interactive=speed != "fast"),
                            inputs=speed_radio, outputs=silence_guard_cb, queue=False)
 
         history_dd.input(fn=open_job, inputs=[history_dd, job_state],
-                         outputs=[result_md, job_state] + view_outputs, concurrency_id="asr")
+                         outputs=[result_md, job_state] + view_outputs, concurrency_id="asr").success(
+                             fn=clear_feedback, outputs=feedback_outputs, queue=False,
+                             show_progress="hidden", show_progress_on=[])
         history_refresh.click(fn=refresh_history, outputs=history_dd)
-        rediarize_btn.click(fn=rediarize_job, inputs=[job_state, num_spk_dd],
+        rediarize_btn.click(fn=rediarize_job, inputs=[job_state, rediarize_count_dd],
                             outputs=[result_md, job_state] + view_outputs, concurrency_id="asr")
         reflow_btn.click(fn=reflow_job, inputs=job_state,
                          outputs=[result_md, job_state] + view_outputs, concurrency_id="asr")
@@ -1384,9 +1493,13 @@ def build_ui():
         proofread_btn.click(fn=proofread_job, inputs=[job_state, redo_cb],
                             outputs=[proofread_status, job_state] + view_outputs, concurrency_id="asr")
         minutes_btn.click(fn=make_minutes, inputs=job_state,
-                          outputs=[doc_status, job_state] + view_outputs, concurrency_id="asr")
+                          outputs=[minutes_status, job_state] + view_outputs, concurrency_id="asr").then(
+                              fn=workflow_controls, inputs=job_state, outputs=control_outputs, queue=False,
+                              show_progress="hidden", show_progress_on=[])
         insights_btn.click(fn=make_insights, inputs=job_state,
-                           outputs=[doc_status, job_state] + view_outputs, concurrency_id="asr")
+                           outputs=[insights_status, job_state] + view_outputs, concurrency_id="asr").then(
+                               fn=workflow_controls, inputs=job_state, outputs=control_outputs, queue=False,
+                               show_progress="hidden", show_progress_on=[])
         save_edit_btn.click(fn=save_utterance_edits, inputs=[edit_table, job_state],
                             outputs=[edit_status, job_state] + view_outputs, concurrency_id="asr")
 
@@ -1398,11 +1511,13 @@ def build_ui():
         people_save_btn.click(fn=save_people_table, inputs=people_table,
                               outputs=[people_status, vp_name])
 
-        search_btn.click(fn=do_search, inputs=search_box, outputs=search_results)
-        search_box.submit(fn=do_search, inputs=search_box, outputs=search_results)
+        search_btn.click(fn=do_search, inputs=search_box, outputs=[search_results, search_status])
+        search_box.submit(fn=do_search, inputs=search_box, outputs=[search_results, search_status])
         search_results.select(fn=open_search_result, inputs=[search_results, job_state],
                               outputs=[result_md, job_state] + view_outputs + [main_tabs, result_tabs],
-                              concurrency_id="asr", show_progress="hidden", show_progress_on=[])
+                              concurrency_id="asr", show_progress="hidden", show_progress_on=[]).success(
+                                  fn=clear_feedback, outputs=feedback_outputs, queue=False,
+                                  show_progress="hidden", show_progress_on=[])
         refresh_btn.click(fn=refresh_jobs, inputs=job_state, outputs=[job_dd, md_dd])
         job_dd.input(fn=on_job_change, inputs=job_dd, outputs=md_dd)
         export_btn.click(fn=do_export, inputs=[job_dd, md_dd, docx_cb, pdf_cb],

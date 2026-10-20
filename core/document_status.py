@@ -59,7 +59,7 @@ def warning(job: dict, filename: str) -> str:
     label = Path(filename).stem
     if state == "stale":
         return (f"⚠️ **{label}は更新前の内容です。** 作成後に文字起こし・話者などが変更されています。"
-                f"「{label}を作る」を押して作り直してください。")
+                f"「{label}を作り直す」を押して作り直してください。")
     if state == "unknown":
         return (f"⚠️ **{label}の更新状況を確認できません。** 作成時の記録がないか、文書が外部で変更されています。"
                 "現在の文字起こしと一致するとは限りません。必要に応じて作り直してください。")

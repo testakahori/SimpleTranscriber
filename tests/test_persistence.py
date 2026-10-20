@@ -212,9 +212,10 @@ os._exit(17)
             docs.save(self.folder, name, "開始は10時", docs.inputs(job))
         with patch.object(app.glossary, "learn_from_diff", return_value=0):
             result = app.save_utterance_edits([[1, "00:00:20", "話者1", "開始は11時です。"]], job)
-        self.assertIn("議事録は更新前", result[-1])
+        self.assertIn("更新前の文書:", result[-1])
+        self.assertIn("議事録", result[-1])
         self.assertIn("開始は11時", result[2])
-        self.assertIn("要約と考察は更新前", result[-1])
+        self.assertIn("要約と考察", result[-1])
         loaded = app._load_job("test")
         self.assertEqual(docs.status(loaded, "議事録.md"), "stale")
         self.assertIn("更新前", app._job_views(loaded)[4]["label"])
@@ -223,8 +224,8 @@ os._exit(17)
                 patch.object(app.minutes, "generate_minutes", return_value="開始は11時"):
             result = app.make_minutes(loaded, progress=Mock())
         self.assertEqual(docs.status(app._load_job("test"), "議事録.md"), "current")
-        self.assertNotIn("議事録は更新前", result[-1])
-        self.assertIn("要約と考察は更新前", result[-1])
+        self.assertNotIn("議事録", result[-1])
+        self.assertIn("更新前の文書: 要約と考察", result[-1])
 
     def test_failed_generation_preserves_old_document_and_warning(self):
         job = job_at(self.folder)
