@@ -13,6 +13,7 @@ except Exception:
     pass
 
 import datetime
+import copy
 import logging
 import threading
 import time
@@ -26,8 +27,8 @@ from core import audio, checkpoints, config, diarization, document_status, gloss
 from core import export as export_mod
 from core import search as search_mod
 from core import utterances as U
-from core import run_control, worker
-from core.pipeline import _finalize_text, _plain_md, _save_job, _voice_tag
+from core import job_history, run_control, worker
+from core.pipeline import _finalize_text, _plain_md, _save_job as _write_job, _voice_tag
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
@@ -36,6 +37,106 @@ config.ensure_dirs()
 FILE_TYPES = [f".{e.lstrip('.')}" for e in audio.SUPPORTED_EXTS]
 SPEAKER_COUNT_CHOICES = [("自動", 0)] + [(f"{n}人", n) for n in range(1, 11)]
 VIEW_COUNT = 9
+
+
+def _save_job(job, action="発言の修正", backup=True):
+    try:
+        job_history.save(job, _write_job, action, backup)
+    except (ValueError, OSError) as e:
+        raise gr.Error(f"保存できませんでした: {e}") from e
+
+
+def _require_saved(state, allow=None):
+    dirty = (state or {}).get("_dirty", set())
+    if any(kind != allow for kind in dirty):
+        raise gr.Error("未保存の編集があります。「修正を保存」「話者を確定」、または「未保存の編集を破棄」を先に押してください。")
+    if state and not state.get("incomplete"):
+        try:
+            job_history.ensure_current(state)
+        except ValueError as e:
+            raise gr.Error(str(e)) from e
+
+
+def mark_unsaved(state, kind):
+    if not state or state.get("incomplete"):
+        return state
+    state = copy.deepcopy(state)
+    state.setdefault("_dirty", set()).add(kind)
+    return state
+
+
+def discard_edits(state):
+    if not state:
+        raise gr.Error("結果を開いてください。")
+    job = _load_job(Path(state["job_dir"]).name)
+    if not job:
+        raise gr.Error("保存済みの結果を開けませんでした。画面の編集内容は残しています。")
+    return ("保存済みの内容に戻しました。", job) + _job_views(job)
+
+
+def restore_edits(state, version):
+    _require_saved(state)
+    if not state or state.get("incomplete"):
+        raise gr.Error("完成した結果を開いてください。")
+    try:
+        job = job_history.restore(state, version, _write_job)
+    except (ValueError, OSError) as e:
+        raise gr.Error(str(e)) from e
+    return ("編集前の本文・話者を復元しました。人物辞書・修正学習・声紋は変更していません。", job) + _job_views(job)
+
+
+def open_search_result(rows, state, event: gr.SelectData):
+    _require_saved(state)
+    table = _rows(rows)
+    row = event.index[0] if isinstance(event.index, (tuple, list)) else event.index
+    if not isinstance(row, int) or not 0 <= row < len(table):
+        raise gr.Error("検索結果の行を選んでください。")
+    name, filename = table[row][:2]
+    if name not in output.list_editable_jobs():
+        raise gr.Error("この結果は本文データのない旧形式です。Word/PDF出力から文書を確認してください。")
+    tab = {"議事録.md": "minutes", "要約と考察.md": "insights"}.get(filename, "transcript")
+    return open_job(name, state) + (gr.update(selected="transcribe"), gr.update(selected=tab))
+
+
+def use_reduced_audio(path, state):
+    _require_saved(state)
+    if not path or not Path(path).is_file():
+        raise gr.Error("先にノイズ補正を実行してください。")
+    return ([path], False, gr.update(selected="transcribe"),
+            "補正音声をセットしました。背景ノイズ除去はOFFにしました。内容を確認して「文字起こし開始」を押してください。")
+
+
+def workflow_controls(state):
+    dirty = (state or {}).get("_dirty", set())
+    complete = bool(state and not state.get("incomplete"))
+    ready = complete and not dirty
+    can_generate = ready and any(u.get("text", "").strip() for u in state.get("utterances", []))
+    versions = job_history.choices(state)
+    if not state:
+        context = "音声ファイルを選んで開始するか、「過去の結果を開く」から保存済みの会議を選んでください。"
+    else:
+        status = "途中保存・全編未完了" if state.get("incomplete") else "文字起こし完了"
+        context = (f"**表示中: {Path(state['job_dir']).name}**  \n"
+                   f"{status} ／ 音声 {U.format_hms(state.get('duration', 0))} ／ 発言 {len(state['utterances'])}件")
+        if complete:
+            pending = sum(bool(u.get("proofread_pending")) for u in state["utterances"])
+            context += f" ／ AI校正の再確認 {pending}件" if pending else ""
+            context += "  \n本文と話者を確認・保存してから、議事録や要約を作成してください。"
+    return (
+        context, "⚠️ 未保存の編集があります。保存・確定するか、破棄してから次へ進んでください。" if dirty else "",
+        gr.update(choices=versions, value=None),
+        gr.update(interactive=bool(versions) and ready),  # restore
+        gr.update(interactive=complete),  # 競合した古い画面も保存済みの内容へ読み直せる。
+        gr.update(interactive=bool(state and state.get("incomplete")) and not dirty),  # resume
+        gr.update(interactive=ready and bool(state.get("audio_path")) if state else False),
+        gr.update(interactive=ready), gr.update(interactive=can_generate),  # reflow/proofread
+        gr.update(interactive=can_generate), gr.update(interactive=can_generate),  # documents
+        gr.update(interactive=complete and "text" not in dirty),  # assign
+        gr.update(interactive=complete and "speakers" not in dirty),  # save text
+        gr.update(interactive=complete and "text" not in dirty),  # speaker table
+        gr.update(interactive=complete and "speakers" not in dirty),  # edit table
+        gr.update(interactive=not dirty, value=Path(state["job_dir"]).name if state else None),
+    )
 
 
 def preview_noise_sample(source, start, end):
@@ -107,7 +208,10 @@ def _file_url(path: str | None) -> str:
 
 def _load_job(job_name: str) -> dict | None:
     job_dir = output.job_path(job_name)
-    data = output.load_json(job_dir, "utterances.json")
+    try:
+        data, saved_revision = job_history.load(job_dir)
+    except (ValueError, OSError) as e:
+        raise gr.Error("保存済みの本文を読めません。会議フォルダ内の .history に編集前の本文が残っている場合があります。") from e
     if not data:
         partial = output.load_json(job_dir, checkpoints.FILENAME)
         return checkpoints.as_job(job_dir, partial) if partial else None
@@ -122,6 +226,7 @@ def _load_job(job_name: str) -> dict | None:
         "utterances": data.get("utterances", []),
         "cluster_embeddings": output.load_json(job_dir, "speaker_clusters.json", {}) or {},
         "audio_path": str(preview) if preview.exists() else None,
+        "_revision": saved_revision,
     }
 
 
@@ -175,6 +280,8 @@ def _edit_rows(job: dict) -> list[list]:
 
 def _job_views(job: dict):
     """結果表示コンポーネント一式の更新値"""
+    if not job.get("incomplete"):
+        job.setdefault("_revision", job_history.revision(Path(job["job_dir"])))
     return (
         U.render_html(job["utterances"], _file_url(job.get("audio_path"))),
         _read_md(job, "議事録.md") or "_議事録はまだありません（文字起こしを確認・修正してから「③ 📋 議事録を作る」を押してください）_",
@@ -245,8 +352,9 @@ def _paused_message(job):
 
 
 def resume_transcription(state, files, model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on,
-                         meeting_date, memo, decoding="stable", silence_guard=True, progress=gr.Progress(),
-                         request: gr.Request = None):
+                         meeting_date, memo, decoding="stable", silence_guard=True, current_state=None,
+                         progress=gr.Progress(), request: gr.Request = None):
+    _require_saved(current_state or state)
     if not state or not state.get("incomplete"):
         return ("⚠️ 履歴から「途中保存」の結果を開いてください。", gr.update()) + \
             tuple(gr.update() for _ in range(VIEW_COUNT)) + (refresh_history(),)
@@ -274,8 +382,9 @@ def resume_transcription(state, files, model_name, speed, language, num_speakers
 
 
 def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fillers_on, diarize_on,
-              meeting_date, memo, decoding="stable", silence_guard=True, progress=gr.Progress(),
-              request: gr.Request = None):
+              meeting_date, memo, decoding="stable", silence_guard=True, current_state=None,
+              progress=gr.Progress(), request: gr.Request = None):
+    _require_saved(current_state)
     """① 音声 → 文字起こし（話者識別まで）。AIの校正・議事録は②③で別に行う"""
     if not files:
         return ("⚠️ ファイルを選択してください。", gr.update()) + \
@@ -354,7 +463,8 @@ def run_batch(files, model_name, speed, language, num_speakers, noise, eq_on, fi
         gr.update(choices=jobs_list, value=Path(last["job_dir"]).name),)
 
 
-def open_job(job_name):
+def open_job(job_name, state=None):
+    _require_saved(state)
     job = _load_job(job_name) if job_name else None
     if not job:
         return ("⚠️ 開けませんでした（古い形式の出力には対応していません）", gr.update()) + \
@@ -363,6 +473,7 @@ def open_job(job_name):
 
 
 def rediarize_job(state, num_speakers, progress=gr.Progress()):
+    _require_saved(state)
     """保存済みの文字起こし（単語タイミング）と再生用音声を使って、話者識別だけやり直す"""
     none = tuple(gr.update() for _ in range(VIEW_COUNT))
     if not state:
@@ -373,7 +484,7 @@ def rediarize_job(state, num_speakers, progress=gr.Progress()):
         return ("❌ 話者分離ライブラリが未導入です。", gr.update()) + none
     if not state.get("audio_path") or not Path(state["audio_path"]).exists():
         return ("⚠️ この結果には再生用音声(audio.m4a)が無いため、やり直せません。", gr.update()) + none
-    job = state
+    job = copy.deepcopy(state)
     settings = config.load_settings()
     llm.unload_ollama(settings)  # GPUを空ける
     progress(0.02, desc="準備中...")
@@ -389,29 +500,28 @@ def rediarize_job(state, num_speakers, progress=gr.Progress()):
     if not word_speakers:
         return ("❌ 話者識別に失敗しました（ログを確認してください）", gr.update()) + none
     threshold = settings.get("postprocess", {}).get("red_threshold", 0.5)
-    people_list = people.load_people()
-    utts = U.build_utterances(segments, word_speakers, threshold)
-    _finalize_text(utts, people_list)
+    utts = U.relabel_preserving_edits(job["utterances"], word_speakers, threshold)
     job["utterances"] = utts
     job["cluster_embeddings"] = cluster_embeddings
-    _save_job(job)
+    _save_job(job, "話者識別のやり直し")
     stats = U.speaker_stats(utts)
     msg = (f"✅ 話者識別をやり直しました: {len(stats)}名 ／ 発言 {len(utts)} 件"
            + (f"\n\n🔊 声紋で自動認識: " + "、".join(f"{k}（{v:.2f}）" for k, v in matched.items())
               if matched else "")
-           + "\n\n※ 文字は音声認識の結果から作り直しました（AI校正・手修正は反映されていません）。"
+           + "\n\nAI校正・手修正した本文は保持しました。修正済みの発言内で複数の声がある場合は、長く話した人を割り当てています。"
              "議事録に反映するには「③ 📋 議事録を作る」を押してください。")
     return (msg, job) + _job_views(job)
 
 
 def reflow_job(state):
+    _require_saved(state)
     """保存済みの結果を、今の句読点・話者まとめ規則で組み直す（GPU不要ですぐ終わる）"""
     none = tuple(gr.update() for _ in range(VIEW_COUNT))
     if not state:
         return ("⚠️ 先に文字起こしを実行するか、過去の結果を開いてください。", gr.update()) + none
     if state.get("incomplete"):
         return (checkpoints.READ_ONLY_NOTICE, state) + none
-    job = state
+    job = copy.deepcopy(state)
     people_list = people.load_people()
     edited = U.count_edited(job["utterances"], lambda t: U.fix_ichi(
         glossary.apply_corrections(people.apply_aliases(t, people_list))))
@@ -429,7 +539,7 @@ def reflow_job(state):
     utts = U.reflow(job["utterances"], threshold)
     _finalize_text(utts, people_list)
     job["utterances"] = utts
-    _save_job(job)
+    _save_job(job, "文の区切りの整形")
     msg = (f"✅ 文の区切り・句読点を整え直しました（{before} 行 → {len(U.sentence_rows(utts))} 行）"
            "\n\n※ 文字は音声認識の結果から作り直しました（AI校正・手修正は反映されていません）。"
            "議事録に反映するには「③ 📋 議事録を作る」を押してください。")
@@ -458,6 +568,8 @@ def _llm_ready(state):
         return "⚠️ 先に文字起こしを実行するか、過去の結果を開いてください。"
     if state.get("incomplete"):
         return checkpoints.READ_ONLY_NOTICE
+    if not any(u.get("text", "").strip() for u in state.get("utterances", [])):
+        return "⚠️ 発言がないためAI処理を開始できません。元音声と認識結果を確認してください。"
     # Whisper・声紋モデルをVRAMから降ろして、LLM(gemma4)にGPUを譲る
     transcriber.unload()
     diarization.unload()
@@ -474,17 +586,14 @@ def _eta(started: float, frac: float) -> str:
 
 
 def proofread_job(state, redo, progress=gr.Progress()):
+    _require_saved(state)
     """② AI校正。校正済み・手修正済みの発言は飛ばすので、途中で止まっても続きから再開できる"""
     none = tuple(gr.update() for _ in range(VIEW_COUNT))
     err = _llm_ready(state)
     if err:
         return (err, gr.update()) + none
-    job = state
+    job = copy.deepcopy(state)
     settings = config.load_settings()
-    if redo:
-        for u in job["utterances"]:
-            u.pop("proofread", None)
-
     people_list = people.load_people()
 
     def norm(t):
@@ -492,7 +601,9 @@ def proofread_job(state, redo, progress=gr.Progress()):
 
     def skip(u):
         # 校正済み・手修正済み（本文が音声認識の結果と違う＝以前の版で手で直した分も含む）は触らない
-        return bool(u.get("proofread") or u.get("human") or U.count_edited([u], norm))
+        # AI校正で変更された本文は redo で対象に戻す。旧版の手修正推定は校正印がない場合だけ。
+        return bool(u.get("human") or (u.get("proofread") and not redo)
+                    or (not u.get("proofread") and not u.get("proofread_pending") and U.count_edited([u], norm)))
 
     todo = sum(1 for u in job["utterances"] if not skip(u))
     if not todo:
@@ -500,14 +611,24 @@ def proofread_job(state, redo, progress=gr.Progress()):
                 job) + _job_views(job)
     started = time.time()
     progress(0, desc=f"AI校正の準備中...（対象 {todo} 発言）")
+    first_save = True
+
+    def save_chunk():
+        nonlocal first_save
+        _save_job(job, "AI校正", backup=first_save)
+        first_save = False
+
     try:
         done, changed = minutes.proofread_utterances(
-            settings, job["utterances"], skip=skip, on_chunk=lambda: _save_job(job),
+            settings, job["utterances"], skip=skip, on_chunk=save_chunk,
             progress_cb=lambda f: progress(f, desc=f"AI校正中... {int(f * 100)}%{_eta(started, f)}"))
         msg = f"✅ AI校正が終わりました（{done}発言を確認、{changed}発言を修正）"
     except llm.LLMError as e:
         msg = f"⚠️ AI校正を途中で止めました: {e}\n\nここまでの結果は保存済みです。もう一度押すと続きから再開します。"
-    _save_job(job)
+    _save_job(job, "AI校正", backup=first_save)
+    pending = sum(bool(u.get("proofread_pending")) for u in job["utterances"])
+    if pending:
+        msg += f"\n\n⚠️ {pending}発言はAIの回答が欠落・不適切だったため元の文章を保持しました。再度「AI校正」を押すと再試行します。"
     notice = llm.pop_fallback_notice()
     if notice:
         msg += f"\n\n⚠️ {notice}"
@@ -516,6 +637,7 @@ def proofread_job(state, redo, progress=gr.Progress()):
 
 
 def _make_doc(state, kind: str, progress):
+    _require_saved(state)
     none = tuple(gr.update() for _ in range(VIEW_COUNT))
     if state and state.get("incomplete"):
         return (checkpoints.READ_ONLY_NOTICE, state) + none
@@ -527,7 +649,7 @@ def _make_doc(state, kind: str, progress):
     err = _llm_ready(state)
     if err:
         return (err, gr.update()) + none
-    job = state
+    job = copy.deepcopy(state)
     settings = config.load_settings()
     source = document_status.inputs(job)
     label, filename, fn = (("議事録", "議事録.md", minutes.generate_minutes) if kind == "minutes"
@@ -535,6 +657,8 @@ def _make_doc(state, kind: str, progress):
     progress(0.1, desc=f"{label}を作成中...（長い会議は区間ごとのメモを作ってからまとめます）")
     try:
         md = fn(settings, source["transcript"], source["source"], source["meeting_date"])
+        if not md or not md.strip():
+            raise llm.LLMError("AIから本文が返りませんでした。以前の文書は保持しています。")
         document_status.save(Path(job["job_dir"]), filename, md, source)
         msg = f"✅ {label}を作りました（上の「{label}」タブで確認・📥 からダウンロード）"
     except (llm.LLMError, OSError) as e:
@@ -544,6 +668,8 @@ def _make_doc(state, kind: str, progress):
         msg += f"\n\n⚠️ {notice}"
     if learned:
         msg += f"\n\n{learned}"
+    # 他プロセスで編集された場合も生成元との差を正しく警告する。
+    job = _load_job(Path(job["job_dir"]).name) or job
     return (msg, job) + _job_views(job)
 
 
@@ -561,11 +687,12 @@ def make_insights(state, progress=gr.Progress()):
 # =====================================================================
 
 def assign_speakers(rows, save_voice, state):
+    _require_saved(state, allow="speakers")
     if not state:
         return ("⚠️ 先に文字起こしを実行してください。", state) + tuple(gr.update() for _ in range(VIEW_COUNT))
     if state.get("incomplete"):
         return (checkpoints.READ_ONLY_NOTICE, state) + tuple(gr.update() for _ in range(VIEW_COUNT))
-    job = state
+    job = copy.deepcopy(state)
     embeddings = job.get("cluster_embeddings", {}) or {}
     people_list = people.load_people()
     known_names = {p["display_name"] for p in people_list}
@@ -586,12 +713,6 @@ def assign_speakers(rows, save_voice, state):
     grouped = {}
     for label, vec in embeddings.items():
         grouped.setdefault(mapping.get(label, label), []).append(vec)
-    if save_voice:
-        learned = _learn_voices(job)
-    else:  # ①の直後に自動で学習した分が付け間違いだった場合に残さない
-        learned = ""
-        if diarization.available():
-            diarization.forget_job(_voice_tag(job["job_dir"]))
     embeddings = {n: (v[0] if len(v) == 1 else [sum(x) / len(v) for x in zip(*v)])
                   for n, v in grouped.items()}
     done = []
@@ -600,10 +721,20 @@ def assign_speakers(rows, save_voice, state):
             people_list.append({"display_name": new_name, "aliases": []})
             known_names.add(new_name)
         done.append(f"{label}→{new_name}")
-    people.save_people(people_list)
     job["cluster_embeddings"] = embeddings
-    _save_job(job)
+    job.pop("_dirty", None)
+    _save_job(job, "話者名の確定")
     msg = f"✅ 話者を確定しました: {'、'.join(done)}"
+    learned = ""
+    try:
+        people.save_people(people_list)
+        if save_voice:
+            learned = _learn_voices(job)
+        elif diarization.available():
+            diarization.forget_job(_voice_tag(job["job_dir"]))
+    except Exception:
+        logging.exception("話者名は保存しましたが辞書・声紋の更新に失敗しました")
+        msg += "\n\n⚠️ 人物辞書・声紋の更新は完了しませんでした。話者名は保存済みです。"
     if learned:
         msg += f"\n\n{learned}"
     msg += "\n\n議事録に反映するには「③ 📋 議事録を作る」を押してください。"
@@ -611,21 +742,25 @@ def assign_speakers(rows, save_voice, state):
 
 
 def save_utterance_edits(rows, state):
+    _require_saved(state, allow="text")
     if not state:
         return ("⚠️ 先に文字起こしを実行してください。", state) + tuple(gr.update() for _ in range(VIEW_COUNT))
     if state.get("incomplete"):
         return (checkpoints.READ_ONLY_NOTICE, state) + tuple(gr.update() for _ in range(VIEW_COUNT))
-    job = state
+    job = copy.deepcopy(state)
     utts = job["utterances"]
     shown = job.get("_shown") or [[u.get("speaker", ""), u["text"]] for u in utts]
-    seen, new_utts, learned, changed = set(), [], 0, 0
+    seen, new_utts, learned, changed, corrections = set(), [], 0, 0, []
     for row in _rows(rows):
         try:
-            idx = int(float(_cell(row, 0, "0"))) - 1
-        except ValueError:
-            continue
+            number = float(_cell(row, 0, "0"))
+            if not number.is_integer():
+                raise ValueError()
+            idx = int(number) - 1
+        except (ValueError, OverflowError):
+            raise gr.Error("行番号が不正です。保存せずに止めました。未保存の編集を破棄して開き直してください。")
         if not (0 <= idx < len(utts)) or idx in seen:
-            continue
+            raise gr.Error("行番号の重複・範囲外を検出したため保存しません。未保存の編集を破棄して開き直してください。")
         seen.add(idx)
         u = dict(utts[idx])
         old_sp, old_text = shown[idx] if idx < len(shown) else (u.get("speaker", ""), u["text"])
@@ -634,21 +769,32 @@ def save_utterance_edits(rows, state):
             changed += 1  # 空にした行は削除扱い
             continue
         if text != old_text:  # 表示していた内容から人が変えた場合のみ
-            learned += glossary.learn_from_diff(old_text, text)
+            corrections.append((old_text, text))
             u["text"] = text
             u["marked"] = text  # 人が確認した文は赤字を解除
             u["human"] = True  # AI校正で上書きしない
+            u.pop("proofread_pending", None)
             changed += 1
         if speaker != (old_sp or ""):
             u["speaker"] = speaker
             changed += 1
         new_utts.append(u)
+    if seen != set(range(len(utts))):
+        raise gr.Error("編集表の行が欠けているため保存しません。発言を削除する場合は行を消さず、内容を空にしてください。")
     new_utts.sort(key=lambda u: u["start"])
     job["utterances"] = new_utts
+    job.pop("_dirty", None)
     _save_job(job)
+    try:
+        learned = sum(glossary.learn_from_diff(old, new) for old, new in corrections)
+    except Exception:
+        logging.exception("本文は保存しましたが修正学習に失敗しました")
+        learned = -1
     msg = f"✅ 保存しました（{changed}箇所を変更）"
-    if learned:
+    if learned > 0:
         msg += f"。{learned}件の言い間違い・誤認識を学習しました（同じ修正が{glossary.PROMOTE_COUNT}回で自動適用）"
+    elif learned < 0:
+        msg += "。修正学習は失敗しましたが、本文は保存されています。"
     return (msg, job) + _job_views(job)
 
 
@@ -740,11 +886,13 @@ def do_search(query):
     return rows or [["", "", "", "該当なし"]]
 
 
-def refresh_jobs():
-    jobs = output.list_jobs()
-    files = output.list_md_files(jobs[0]) if jobs else []
-    return (gr.update(choices=jobs, value=jobs[0] if jobs else None),
-            gr.update(choices=files, value=files[0] if files else None))
+def refresh_jobs(state=None):
+    jobs = [name for name in output.list_jobs() if output.list_md_files(name)]
+    selected = Path(state["job_dir"]).name if state else None
+    selected = selected if selected in jobs else None
+    files = output.list_md_files(selected) if selected else []
+    preferred = "議事録.md" if "議事録.md" in files else (files[0] if files else None)
+    return (gr.update(choices=jobs, value=selected), gr.update(choices=files, value=preferred))
 
 
 def on_job_change(job_name):
@@ -893,9 +1041,9 @@ def build_ui():
 
         job_state = gr.State(None)
 
-        with gr.Tabs():
+        with gr.Tabs() as main_tabs:
             # ======================== 文字起こし ========================
-            with gr.Tab("🎙️ 文字起こし"):
+            with gr.Tab("🎙️ 文字起こし", id="transcribe"):
                 with gr.Row(equal_height=False):
                     with gr.Column(scale=4, min_width=320):
                         files_input = gr.File(
@@ -960,34 +1108,36 @@ def build_ui():
                         with gr.Row():
                             history_dd = gr.Dropdown(
                                 label="📂 過去の結果を開く", choices=output.list_editable_jobs(),
-                                scale=4)
+                                value=None, scale=4)
                             history_refresh = gr.Button("🔄", scale=1, min_width=40)
-                        resume_btn = gr.Button("▶ 途中保存から再開", size="sm")
+                        resume_btn = gr.Button("▶ 途中保存から再開", size="sm", interactive=False)
                         gr.Markdown("<small>履歴から途中保存を開いて再開します。保存時の音声・設定を使うため、"
                                     "新しい形式の結果はファイルの再選択が不要です。境界付近だけ聞き直します。</small>")
                         rediarize_btn = gr.Button("👥 話者識別だけやり直す（上の「話者の人数」を使用）",
-                                                  size="sm")
+                                                  size="sm", interactive=False)
                         reflow_btn = gr.Button("✂️ 文の区切り・句読点を整え直す（数秒・音声解析なし）",
-                                               size="sm")
+                                               size="sm", interactive=False)
 
                     with gr.Column(scale=7):
+                        current_job = gr.Markdown(workflow_controls(None)[0], elem_id="st-current-job")
                         job_notice = gr.Markdown(elem_id="st-job-notice")
+                        draft_status = gr.Markdown(elem_id="st-draft-status")
                         with gr.Row(elem_classes="st-dl"):
                             dl_transcript = gr.DownloadButton("📥 文字起こし.md", interactive=False,
                                                               variant="primary")
                             dl_minutes = gr.DownloadButton("📥 議事録.md", interactive=False)
                             dl_insights = gr.DownloadButton("📥 要約と考察.md", interactive=False)
-                        with gr.Tabs():
-                            with gr.Tab("📜 文字起こし"):
+                        with gr.Tabs() as result_tabs:
+                            with gr.Tab("📜 文字起こし", id="transcript"):
                                 # Gradio 6.6のHTMLは連続更新時に古いDOMが残る。MarkdownのHTML表示を使う。
                                 # 本文・話者・音声URLはU.render_htmlがエスケープする。時刻クリックは残す。
                                 transcript_html = gr.Markdown(
                                     '<div style="padding:40px;text-align:center;opacity:.6">'
                                     "ここに「時刻・話者・発言」が表示されます</div>",
                                     sanitize_html=False, latex_delimiters=[])
-                            with gr.Tab("📋 議事録"):
+                            with gr.Tab("📋 議事録", id="minutes"):
                                 minutes_view = gr.Markdown()
-                            with gr.Tab("💡 要約と考察"):
+                            with gr.Tab("💡 要約と考察", id="insights"):
                                 insights_view = gr.Markdown()
 
                         gr.Markdown("### ② 確認・修正")
@@ -996,11 +1146,11 @@ def build_ui():
                                         "登録済み人物は自動で名前が付いています。")
                             speaker_table = gr.Dataframe(
                                 headers=["今の表示", "名前"], datatype=["str", "str"],
-                                column_count=(2, "fixed"), interactive=True,
+                                column_count=(2, "fixed"), interactive=False, static_columns=[0],
                             )
                             with gr.Row():
                                 save_voice_cb = gr.Checkbox(value=True, label="声紋として保存する")
-                                assign_btn = gr.Button("✅ 話者を確定", variant="primary")
+                                assign_btn = gr.Button("✅ 話者を確定", variant="primary", interactive=False)
                             assign_status = gr.Markdown()
 
                         with gr.Accordion("✏️ 発言を修正（直した言葉は学習して次回から自動で直ります）",
@@ -1009,22 +1159,29 @@ def build_ui():
                             edit_table = gr.Dataframe(
                                 headers=["No", "時刻", "話者", "内容"],
                                 datatype=["number", "str", "str", "str"],
-                                column_count=(4, "fixed"), interactive=True, wrap=True,
+                                column_count=(4, "fixed"), interactive=False, wrap=True, static_columns=[0, 1],
                                 max_height=500,
                             )
-                            save_edit_btn = gr.Button("💾 修正を保存して学習", variant="primary")
+                            save_edit_btn = gr.Button("💾 修正を保存して学習", variant="primary", interactive=False)
                             edit_status = gr.Markdown()
+                        with gr.Accordion("編集を取り消す・以前の本文に戻す", open=False):
+                            discard_btn = gr.Button("未保存の編集を破棄", interactive=False)
+                            gr.Markdown("保存・AI校正・整形の前の本文と話者を復元できます。"
+                                        "人物辞書・修正学習・声紋は戻りません。")
+                            version_dd = gr.Dropdown(label="戻したい編集履歴", choices=[], value=None)
+                            restore_btn = gr.Button("選んだ履歴の本文・話者に戻す", interactive=False)
+                            restore_status = gr.Markdown()
                         with gr.Row():
                             proofread_btn = gr.Button("✍️ AI校正（誤変換を文脈で直す・途中からでも再開できる）",
-                                                      scale=3)
+                                                      scale=3, interactive=False)
                             redo_cb = gr.Checkbox(value=False, label="校正済みもやり直す", scale=1)
                         proofread_status = gr.Markdown()
 
                         gr.Markdown("### ③ 議事録")
                         gr.Markdown("<small>②で直した今の文字起こしから、`議事録テンプレート.md` の形で作ります。</small>")
                         with gr.Row():
-                            minutes_btn = gr.Button("📋 議事録を作る", variant="primary", scale=2)
-                            insights_btn = gr.Button("💡 要約と考察を作る", scale=1)
+                            minutes_btn = gr.Button("📋 議事録を作る", variant="primary", scale=2, interactive=False)
+                            insights_btn = gr.Button("💡 要約と考察を作る", scale=1, interactive=False)
                         doc_status = gr.Markdown()
 
             # ======================== ノイズの見本で補正 ========================
@@ -1041,11 +1198,12 @@ def build_ui():
                 noise_apply_btn = gr.Button("この見本で音声全体のノイズを弱める", variant="primary")
                 noise_status = gr.Markdown()
                 with gr.Row():
-                    noise_reduced = gr.Audio(label="除去後", interactive=False)
+                    noise_reduced = gr.Audio(label="除去後", type="filepath", interactive=False)
                     noise_removed = gr.Audio(label="削った音（ここに説明者の声がないか確認）", interactive=False)
                 noise_download = gr.File(label="補正音声を保存", interactive=False)
+                noise_use_btn = gr.Button("この補正音声を文字起こしに使う")
                 gr.Markdown("元音声は変更しません。補正音声で文字起こしする場合は、"
-                            "文字起こしタブにこのファイルを指定し、「背景ノイズ除去」をOFFにして二重処理を避けてください。")
+                            "上のボタンで文字起こしタブに渡すと「背景ノイズ除去」を自動でOFFにします。")
 
             # ======================== 人物・声紋 ========================
             with gr.Tab("👤 人物・声紋登録"):
@@ -1089,6 +1247,7 @@ def build_ui():
             # ======================== 検索 ========================
             with gr.Tab("🔍 検索"):
                 gr.Markdown("過去の全議事録・文字起こし・要約を横断検索します（スペース区切りでAND検索）。")
+                gr.Markdown("結果の行を選ぶと、その会議の本文・議事録・要約を開きます。")
                 with gr.Row():
                     search_box = gr.Textbox(label="キーワード", placeholder="例: 見積 坪内", scale=4)
                     search_btn = gr.Button("検索", variant="primary", scale=1)
@@ -1096,7 +1255,7 @@ def build_ui():
                                               interactive=False, wrap=True)
 
             # ======================== Word/PDF ========================
-            with gr.Tab("📄 Word/PDF出力"):
+            with gr.Tab("📄 Word/PDF出力") as export_tab:
                 gr.Markdown("生成済みのMarkdownを提出用の Word / PDF に変換します（赤字も維持されます）。")
                 with gr.Row():
                     job_dd = gr.Dropdown(label="出力フォルダ", choices=[], scale=3)
@@ -1170,17 +1329,33 @@ def build_ui():
         # ======================== イベント ========================
         view_outputs = [transcript_html, minutes_view, insights_view,
                         dl_transcript, dl_minutes, dl_insights, speaker_table, edit_table, job_notice]
+        control_outputs = [current_job, draft_status, version_dd, restore_btn, discard_btn,
+                           resume_btn, rediarize_btn, reflow_btn, proofread_btn, minutes_btn, insights_btn,
+                           assign_btn, save_edit_btn, speaker_table, edit_table, history_dd]
+        job_state.change(fn=workflow_controls, inputs=job_state, outputs=control_outputs,
+                         queue=False, show_progress="hidden", show_progress_on=[])
+        edit_table.input(fn=lambda state: mark_unsaved(state, "text"), inputs=job_state,
+                         outputs=job_state, concurrency_id="asr")
+        speaker_table.input(fn=lambda state: mark_unsaved(state, "speakers"), inputs=job_state,
+                            outputs=job_state, concurrency_id="asr")
+        discard_btn.click(fn=discard_edits, inputs=job_state,
+                          outputs=[restore_status, job_state] + view_outputs, concurrency_id="asr")
+        restore_btn.click(fn=restore_edits, inputs=[job_state, version_dd],
+                          outputs=[restore_status, job_state] + view_outputs, concurrency_id="asr")
+        noise_use_btn.click(fn=use_reduced_audio, inputs=[noise_reduced, job_state],
+                            outputs=[files_input, noise_cb, main_tabs, result_md],
+                            concurrency_id="asr", show_progress="hidden", show_progress_on=[])
 
         noise_preview_btn.click(fn=preview_noise_sample, inputs=[noise_source, noise_start, noise_end],
                                 outputs=noise_sample_player)
         noise_apply_btn.click(fn=apply_noise_sample, inputs=[noise_source, noise_start, noise_end, noise_strength],
-                              outputs=[noise_status, noise_reduced, noise_removed, noise_download])
+                              outputs=[noise_status, noise_reduced, noise_removed, noise_download], concurrency_id="asr")
 
         pause_btn.click(fn=pause_transcription, outputs=pause_status, queue=False)
         start_btn.click(
             fn=run_batch,
             inputs=[files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, eq_cb, fillers_cb, diarize_cb,
-                    meeting_date_box, memo_box, decoding_radio, silence_guard_cb],
+                    meeting_date_box, memo_box, decoding_radio, silence_guard_cb, job_state],
             outputs=[result_md, job_state] + view_outputs + [history_dd],
             concurrency_id="asr",
         ).then(fn=lambda: "", outputs=pause_status, queue=False)
@@ -1188,36 +1363,36 @@ def build_ui():
         resume_btn.click(
             fn=resume_transcription,
             inputs=[job_state, files_input, model_dd, speed_radio, lang_dd, num_spk_dd, noise_cb, eq_cb,
-                    fillers_cb, diarize_cb, meeting_date_box, memo_box, decoding_radio, silence_guard_cb],
+                    fillers_cb, diarize_cb, meeting_date_box, memo_box, decoding_radio, silence_guard_cb, job_state],
             outputs=[result_md, job_state] + view_outputs + [history_dd], concurrency_id="asr",
         ).then(fn=lambda: "", outputs=pause_status, queue=False)
 
         speed_radio.change(fn=lambda speed: gr.update(interactive=speed != "fast"),
                            inputs=speed_radio, outputs=silence_guard_cb, queue=False)
 
-        history_dd.input(fn=open_job, inputs=history_dd,
-                         outputs=[result_md, job_state] + view_outputs)
+        history_dd.input(fn=open_job, inputs=[history_dd, job_state],
+                         outputs=[result_md, job_state] + view_outputs, concurrency_id="asr")
         history_refresh.click(fn=refresh_history, outputs=history_dd)
         rediarize_btn.click(fn=rediarize_job, inputs=[job_state, num_spk_dd],
-                            outputs=[result_md, job_state] + view_outputs)
+                            outputs=[result_md, job_state] + view_outputs, concurrency_id="asr")
         reflow_btn.click(fn=reflow_job, inputs=job_state,
-                         outputs=[result_md, job_state] + view_outputs)
+                         outputs=[result_md, job_state] + view_outputs, concurrency_id="asr")
 
         assign_btn.click(fn=assign_speakers, inputs=[speaker_table, save_voice_cb, job_state],
-                         outputs=[assign_status, job_state] + view_outputs
-                         ).then(fn=_voiceprint_rows, outputs=vp_table)
+                         outputs=[assign_status, job_state] + view_outputs,
+                         concurrency_id="asr").then(fn=_voiceprint_rows, outputs=vp_table)
         proofread_btn.click(fn=proofread_job, inputs=[job_state, redo_cb],
-                            outputs=[proofread_status, job_state] + view_outputs)
+                            outputs=[proofread_status, job_state] + view_outputs, concurrency_id="asr")
         minutes_btn.click(fn=make_minutes, inputs=job_state,
-                          outputs=[doc_status, job_state] + view_outputs)
+                          outputs=[doc_status, job_state] + view_outputs, concurrency_id="asr")
         insights_btn.click(fn=make_insights, inputs=job_state,
-                           outputs=[doc_status, job_state] + view_outputs)
+                           outputs=[doc_status, job_state] + view_outputs, concurrency_id="asr")
         save_edit_btn.click(fn=save_utterance_edits, inputs=[edit_table, job_state],
-                            outputs=[edit_status, job_state] + view_outputs)
+                            outputs=[edit_status, job_state] + view_outputs, concurrency_id="asr")
 
         vp_enroll_btn.click(fn=enroll_voice, inputs=[vp_name, vp_audio, vp_file],
-                            outputs=[vp_status, vp_table, vp_del_name, people_table, vp_audio, vp_file])
-        vp_test_btn.click(fn=test_voice, inputs=[vp_audio, vp_file], outputs=vp_status)
+                            outputs=[vp_status, vp_table, vp_del_name, people_table, vp_audio, vp_file], concurrency_id="asr")
+        vp_test_btn.click(fn=test_voice, inputs=[vp_audio, vp_file], outputs=vp_status, concurrency_id="asr")
         vp_del_btn.click(fn=delete_voice, inputs=vp_del_name,
                          outputs=[vp_del_status, vp_table, vp_del_name])
         people_save_btn.click(fn=save_people_table, inputs=people_table,
@@ -1225,8 +1400,11 @@ def build_ui():
 
         search_btn.click(fn=do_search, inputs=search_box, outputs=search_results)
         search_box.submit(fn=do_search, inputs=search_box, outputs=search_results)
-        refresh_btn.click(fn=refresh_jobs, outputs=[job_dd, md_dd])
-        job_dd.change(fn=on_job_change, inputs=job_dd, outputs=md_dd)
+        search_results.select(fn=open_search_result, inputs=[search_results, job_state],
+                              outputs=[result_md, job_state] + view_outputs + [main_tabs, result_tabs],
+                              concurrency_id="asr", show_progress="hidden", show_progress_on=[])
+        refresh_btn.click(fn=refresh_jobs, inputs=job_state, outputs=[job_dd, md_dd])
+        job_dd.input(fn=on_job_change, inputs=job_dd, outputs=md_dd)
         export_btn.click(fn=do_export, inputs=[job_dd, md_dd, docx_cb, pdf_cb],
                          outputs=[export_status, export_files])
         glossary_save_btn.click(fn=save_glossary_text, inputs=glossary_box, outputs=glossary_status)
@@ -1238,11 +1416,25 @@ def build_ui():
                     cluster_sim_slider, match_sim_slider, hf_token_box],
             outputs=settings_status,
         )
-        test_btn.click(fn=test_llm, outputs=settings_status)
+        test_btn.click(fn=test_llm, outputs=settings_status, concurrency_id="asr")
 
-        demo.load(fn=status_line, outputs=status_md)
-        demo.load(fn=refresh_jobs, outputs=[job_dd, md_dd])
-        demo.load(fn=refresh_history, outputs=history_dd)
+        # Gradio 6.6では非表示タブの出力に完了済みの進捗が残るため、軽い画面同期は対象を明示的に空にする。
+        demo.load(fn=status_line, outputs=status_md, show_progress="hidden", show_progress_on=[])
+        export_tab.select(fn=refresh_jobs, inputs=job_state, outputs=[job_dd, md_dd],
+                          show_progress="hidden", show_progress_on=[])
+        demo.load(fn=refresh_history, outputs=history_dd, show_progress="hidden", show_progress_on=[])
+        demo.load(fn=None, js="""() => {
+            if (!window.stDraftWarningInstalled) {
+                window.addEventListener('beforeunload', event => {
+                    const notice = document.getElementById('st-draft-status');
+                    if (notice && notice.textContent.includes('未保存の編集があります')) {
+                        event.preventDefault();
+                        event.returnValue = '';
+                    }
+                });
+                window.stDraftWarningInstalled = true;
+            }
+        }""")
 
     return demo
 

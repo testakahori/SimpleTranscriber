@@ -37,8 +37,7 @@ def _save_job(job: dict) -> None:
     cues = U.build_cues(utts, sub)
     output.write_text(job_dir, "transcript.srt", U.cues_to_srt(cues, sub.get("speaker_prefix", False)))
     output.write_text(job_dir, "transcript.vtt", U.cues_to_vtt(cues, sub.get("speaker_prefix", False)))
-    if job.get("cluster_embeddings"):
-        output.save_json(job_dir, "speaker_clusters.json", job["cluster_embeddings"])
+    output.save_json(job_dir, "speaker_clusters.json", job.get("cluster_embeddings") or {})
     # 完成データは最後に公開する。途中で失敗した場合、履歴はcheckpoint.jsonを開く。
     output.save_json(job_dir, "utterances.json", {
         "source": job["source"],
