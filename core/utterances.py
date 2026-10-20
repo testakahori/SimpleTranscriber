@@ -255,6 +255,28 @@ def count_edited(utterances: list[dict], normalize=None) -> int:
                and clean(u.get("text")) != clean(norm("".join(w.get("word", "") for w in u["words"]))))
 
 
+def relabel_preserving_edits(utterances: list[dict], labels: dict, threshold=0.5) -> list[dict]:
+    """修正済み本文は単語から作り直さず、発言内で最も長い話者を付ける。"""
+    import copy
+    from collections import defaultdict
+    result = []
+    for i, original in enumerate(utterances):
+        speakers = labels.get(i) or [original.get("speaker", "")]
+        edited = original.get("human") or original.get("proofread") or count_edited([original])
+        if edited or not original.get("words"):
+            u = copy.deepcopy(original)
+            weights = defaultdict(float)
+            words = original.get("words") or [{"start": u["start"], "end": u["end"]}]
+            for j, word in enumerate(words):
+                speaker = speakers[j] if j < len(speakers) else speakers[0]
+                weights[speaker] += max(0.01, word["end"] - word["start"])
+            u["speaker"] = max(weights, key=weights.get)
+            result.append(u)
+        else:
+            result.extend(build_utterances([original], {0: speakers}, threshold))
+    return result
+
+
 def reflow(utterances: list[dict], threshold: float = 0.5) -> list[dict]:
     """保存済みの発話を、今の句読点・話者まとめ規則で組み直す（音声の再解析なし）。
     以前の話者は単語ごとのラベルとして引き継ぐ。文字は単語データから作り直すので、
@@ -270,8 +292,11 @@ def reflow(utterances: list[dict], threshold: float = 0.5) -> list[dict]:
     if not words:
         return utterances
     repair_words(words, labels)
-    return build_utterances([{"start": words[0]["start"], "end": words[-1]["end"], "words": words}],
-                            {0: labels} if any(labels) else None, threshold)
+    rebuilt = build_utterances([{"start": words[0]["start"], "end": words[-1]["end"], "words": words}],
+                              {0: labels} if any(labels) else None, threshold)
+    # 旧データなど単語時刻のない発言も残す。
+    rebuilt.extend(dict(u) for u in utterances if not u.get("words"))
+    return sorted(rebuilt, key=lambda u: u["start"])
 
 
 # =====================================================================
@@ -552,6 +577,8 @@ VIEW_CSS = """
 .st-time{font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums;font-size:12px;
   color:var(--body-text-color-subdued,#71717a);cursor:pointer;user-select:none;display:inline-block}
 .st-time:hover{text-decoration:underline}
+.st-time:focus-visible{outline:2px solid currentColor;outline-offset:3px}
+button.st-time{background:transparent;border:0;padding:4px 0;text-align:left}
 .st-sp{font-weight:700}
 .st-text{white-space:pre-wrap;word-break:break-word}
 .st-red{color:#dc2626;background:rgba(220,38,38,.08);border-radius:3px}
@@ -601,8 +628,10 @@ def render_html(utterances: list[dict], audio_url: str = "") -> str:
         turn = " st-turn" if prev is not None and sp != prev else ""
         prev = sp
         out.append(f'<div class="st-u{turn}"><div class="st-no">{i}</div>')
-        out.append(f'<div class="st-time"{onclick}>{format_srt_time(r["start"])} --&gt; '
-                   f'{format_srt_time(r["end"])}</div>')
+        tag = "button" if audio_url else "div"
+        attrs = f' type="button" aria-label="{format_hms(r["start"])}から再生"' if audio_url else ""
+        out.append(f'<{tag} class="st-time"{attrs}{onclick}>{format_srt_time(r["start"])} --&gt; '
+                   f'{format_srt_time(r["end"])}</{tag}>')
         label = f'<span class="st-sp" style="color:{c}">{html.escape(sp)}:</span> ' if sp else ""
         out.append(f'<div class="st-text">{label}{_escape_keep_red(r["marked"])}</div></div>')
     out.append("</div></div>")

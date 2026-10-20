@@ -7,6 +7,35 @@ BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 INLINE_SPLIT_RE = re.compile(r'(<span style="color:red">.*?</span>|\*\*.+?\*\*)', re.DOTALL)
 
 
+def _table_cells(line):
+    return [cell.strip().replace(r"\|", "|")
+            for cell in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
+
+
+def _blocks(text):
+    """Markdown表は段落と区別する。セル数の不足は空欄で補う。"""
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        if i + 1 < len(lines) and "|" in lines[i]:
+            header = _table_cells(lines[i])
+            separator = _table_cells(lines[i + 1])
+            if len(header) == len(separator) and all(re.fullmatch(r":?-{3,}:?", c) for c in separator):
+                rows = [header]
+                i += 2
+                while i < len(lines) and "|" in lines[i] and lines[i].strip():
+                    cells = _table_cells(lines[i])
+                    # 余分なセルを黙って落とさない。
+                    width = max(len(rows[0]), len(cells))
+                    rows = [r + [""] * (width - len(r)) for r in rows]
+                    rows.append(cells + [""] * (width - len(cells)))
+                    i += 1
+                yield "table", rows
+                continue
+        yield _parse_line(lines[i])
+        i += 1
+
+
 def _parse_line(line: str):
     """行を (kind, content) に分類する。
     kind: h1/h2/h3, check, bullet, text, blank"""
@@ -54,10 +83,28 @@ def md_to_docx(md_path: str, out_path: str) -> str:
     from docx.shared import Pt, RGBColor
 
     doc = Document()
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    normal = doc.styles["Normal"]
+    normal.font.name = "Yu Gothic"
+    normal.font.size = Pt(10)
+    normal.element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), "Yu Gothic")
     text = Path(md_path).read_text(encoding="utf-8")
 
-    for line in text.split("\n"):
-        kind, content = _parse_line(line)
+    for kind, content in _blocks(text):
+        if kind == "table":
+            table = doc.add_table(rows=0, cols=len(content[0]))
+            table.style = "Table Grid"
+            for ri, row in enumerate(content):
+                cells = table.add_row().cells
+                for cell, value in zip(cells, row):
+                    _add_runs_docx(cell.paragraphs[0], re.sub(r"<br\s*/?>", "\n", value))
+                    if ri == 0:
+                        for run in cell.paragraphs[0].runs:
+                            run.bold = True
+            header = OxmlElement("w:tblHeader")
+            table.rows[0]._tr.get_or_add_trPr().append(header)
+            continue
         if kind == "blank":
             continue
         if kind.startswith("h"):
@@ -93,11 +140,12 @@ def md_to_pdf(md_path: str, out_path: str) -> str:
     """reportlab の日本語CIDフォント（HeiseiKakuGo-W5）でPDF化。
     フォントファイル不要で Windows / Mac 両対応。"""
     from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import mm
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, LongTable, TableStyle
 
     font_name = "HeiseiKakuGo-W5"
     try:
@@ -116,8 +164,22 @@ def md_to_pdf(md_path: str, out_path: str) -> str:
 
     text = Path(md_path).read_text(encoding="utf-8")
     flow = []
-    for line in text.split("\n"):
-        kind, content = _parse_line(line)
+    for kind, content in _blocks(text):
+        if kind == "table":
+            rows = [[Paragraph(_inline_markup_pdf(value), styles["text"]) for value in row] for row in content]
+            table = LongTable(rows, colWidths=[(A4[0] - 36 * mm) / len(rows[0])] * len(rows[0]),
+                              repeatRows=1, splitInRow=1, hAlign="LEFT")
+            table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eeeeee")),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#999999")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]))
+            flow.extend([table, Spacer(1, 3 * mm)])
+            continue
         if kind == "blank":
             flow.append(Spacer(1, 3 * mm))
             continue

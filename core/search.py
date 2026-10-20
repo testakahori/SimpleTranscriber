@@ -19,6 +19,8 @@ def search_outputs(query: str) -> list[list[str]]:
 
     results = []
     for md_file in sorted(OUTPUT_DIR.glob("*/*.md"), reverse=True):
+        if md_file.name == "transcript.md" and (md_file.parent / "文字起こし.md").exists():
+            continue  # 同じ本文の内部版を二重に表示しない。
         try:
             text = md_file.read_text(encoding="utf-8")
         except Exception:
@@ -27,7 +29,6 @@ def search_outputs(query: str) -> list[list[str]]:
         # ファイル単位でAND判定
         if not all(k.lower() in lower for k in keywords):
             continue
-        first_kw = keywords[0].lower()
         for line_no, line in enumerate(text.split("\n"), 1):
             line_lower = line.lower()
             if any(k.lower() in line_lower for k in keywords):

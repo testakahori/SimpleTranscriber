@@ -69,6 +69,9 @@ def proofread_utterances(settings: dict, utterances: list[dict], progress_cb=Non
 
     done = changed = 0
     for ci, idxs in enumerate(chunks):
+        for i in idxs:
+            utterances[i].pop("proofread", None)
+            utterances[i]["proofread_pending"] = True
         lines = []
         for i in idxs:
             u = utterances[i]
@@ -87,13 +90,14 @@ def proofread_utterances(settings: dict, utterances: list[dict], progress_cb=Non
         except Exception as e:
             logging.warning(f"校正チャンク{ci}で失敗: {e}")
             continue
+        accepted = set()
         for line in reply.splitlines():
             m = _LINE_RE.match(line)
             if not m:
                 continue
             n = int(m.group(1)) - 1
             body = m.group(2).strip()
-            if n not in idxs or not body:
+            if n not in idxs or n in accepted or not body:
                 continue
             u = utterances[n]
             # LLMが話者名を復唱した場合だけ取り除く（「10:30に集合」等の本文は壊さない）
@@ -113,9 +117,9 @@ def proofread_utterances(settings: dict, utterances: list[dict], progress_cb=Non
                 changed += 1
             u["marked"], u["text"] = new_marked, new_text
             u["proofread"] = True
+            u.pop("proofread_pending", None)
+            accepted.add(n)
             done += 1
-        for i in idxs:  # AIが返さなかった行も「見た」印を付け、再開時に繰り返さない
-            utterances[i]["proofread"] = True
         if on_chunk:
             on_chunk()
         if progress_cb:
