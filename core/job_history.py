@@ -68,15 +68,34 @@ def save(job: dict, writer, action="発言の修正", backup=True) -> None:
         job["_revision"] = revision(folder)
 
 
+_label_cache: dict = {}  # (path, mtime, size) → 一覧の表示名。履歴1件が数MBあるため毎回は読まない
+
+
+def _label(history: Path, path: Path) -> str | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    if key in _label_cache:
+        return _label_cache[key]
+    record = output.load_json(history, path.name, {}) or {}
+    label = (f"{record.get('created_at', '')} ／ {record.get('action', '編集')} の前") if "data" in record else None
+    if len(_label_cache) > 2000:
+        _label_cache.clear()
+    _label_cache[key] = label
+    return label
+
+
 def choices(job: dict | None) -> list[tuple[str, str]]:
     if not job or job.get("incomplete"):
         return []
     history = Path(job["job_dir"]) / ".history"
     rows = []
     for path in sorted(history.glob("*.json"), reverse=True):
-        record = output.load_json(history, path.name, {}) or {}
-        if "data" in record:
-            rows.append((f"{record.get('created_at', '')} ／ {record.get('action', '編集')} の前", path.name))
+        label = _label(history, path)
+        if label:
+            rows.append((label, path.name))
     return rows
 
 

@@ -63,11 +63,12 @@ def initial_prompt_terms(people: list[dict] | None = None) -> list[str]:
         if p.get("display_name"):
             terms.append(p["display_name"])
         terms.extend(str(a).strip() for a in (p.get("aliases") or []) if str(a).strip())
-    return [t for t in terms if not _PLACEHOLDER_RE.match(t)]
+    return [t for t in terms if not _PLACEHOLDER_RE.match(t) and not _SPLIT_SUFFIX_RE.search(t)]
 
 
-_PLACEHOLDER_RE = re.compile(r"^(質問者|話者|参加者|発表者|司会|スピーカー|speaker|不明|unknown)\s*([0-9０-９]+|[A-ZＡ-Ｚ])?$",
-                             re.IGNORECASE)
+_SPLIT_SUFFIX_RE = re.compile(r"(（[0-9０-９]+）|\([0-9]+\))$")  # 「話者を分ける」が付ける仮の番号
+_PLACEHOLDER_RE = re.compile(r"^(質問者|話者|参加者|発表者|司会|スピーカー|speaker|不明|unknown)\s*([0-9０-９]+|[A-ZＡ-Ｚ])?"
+                             r"(（[0-9０-９]+）|\([0-9]+\)|-[0-9]+)?$", re.IGNORECASE)
 
 
 def people_summary_md(people: list[dict] | None = None) -> str:

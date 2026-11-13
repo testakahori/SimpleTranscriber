@@ -92,6 +92,23 @@ def learn_from_diff(before: str, after: str) -> int:
     return learned
 
 
+def learn_pair(wrong: str, right: str, promote: bool = False) -> bool:
+    """「誤→正」を1件学習する。promote=True なら即座に自動適用の回数（PROMOTE_COUNT）まで上げる
+    （一括置換で人が全文に適用した修正は、次回から自動で使ってよい）。学習できたら True。"""
+    wrong, right = (wrong or "").strip(), (right or "").strip()
+    if not _learnable(wrong, right):
+        return False
+    corrections = load_corrections()
+    for c in corrections:
+        if c.get("wrong") == wrong and c.get("right") == right:
+            c["count"] = max(int(c.get("count", 1)) + 1, PROMOTE_COUNT if promote else 0)
+            break
+    else:
+        corrections.append({"wrong": wrong, "right": right, "count": PROMOTE_COUNT if promote else 1})
+    save_corrections(corrections)
+    return True
+
+
 def apply_corrections(text: str) -> str:
     """出現回数が閾値以上の学習済み修正を適用する"""
     for c in load_corrections():

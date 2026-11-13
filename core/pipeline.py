@@ -264,6 +264,7 @@ def _finish_transcription(job_dir, name, wav, preview, duration, result, opts, s
         "job_dir": str(job_dir),
         "source": name,
         "run_options": opts,
+        "speaker_refined": int(diarization.LAST_STATS.get("refined", 0) or 0),
         "duration": duration,
         "meta_line": meta_line,
         "meeting_date": opts.get("meeting_date") or _meeting_date_from_name(name),
@@ -339,7 +340,28 @@ def rediarize(audio_path: str, segments: list[dict], num_speakers: int, settings
         )
     finally:
         Path(wav).unlink(missing_ok=True)
+    matched = dict(matched, _refined=int(diarization.LAST_STATS.get("refined", 0) or 0))
     return word_speakers, {k: v.tolist() for k, v in cluster_embeddings.items()}, matched
+
+
+def split_speaker(audio_path: str, utterances: list[dict], speaker: str, k: int, settings: dict,
+                  progress=None) -> dict:
+    """1つの話者を声紋で k 人に分け直す（別プロセスで実行）。diarization.split_speaker を参照"""
+    progress = progress or (lambda f, d="": None)
+    progress(0.05, "音声を準備中...")
+    wav = audio.prepare_audio(audio_path)
+    try:
+        progress(0.3, f"「{speaker}」の発言ごとに声紋を取っています...")
+        thr = float(settings.get("diarization", {}).get("match_similarity", 0.55))
+        return diarization.split_speaker(wav, utterances, speaker, k, match_similarity=thr)
+    finally:
+        Path(wav).unlink(missing_ok=True)
+
+
+def probe_devices(progress=None) -> dict:
+    """GPUの有無を別プロセスで調べる（アプリ本体に torch / ctranslate2 を読み込ませない）"""
+    return {"asr": transcriber.detect_device()[0],
+            "dia": diarization.device_label() if diarization.available() else "-"}
 
 
 def enroll(src: str, name: str, progress=None) -> tuple[int, float]:

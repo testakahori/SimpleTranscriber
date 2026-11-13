@@ -365,6 +365,52 @@ def remove_fillers(utterances: list[dict], threshold: float = 0.5) -> tuple[list
     return out, removed
 
 
+def count_text(utterances: list[dict], needle: str) -> tuple[int, int]:
+    """(含む発言の数, 出現回数)"""
+    if not needle:
+        return 0, 0
+    hits = [u.get("text", "").count(needle) for u in utterances]
+    return sum(1 for h in hits if h), sum(hits)
+
+
+def replace_text(utterances: list[dict], wrong: str, right: str) -> int:
+    """全発言の本文で wrong → right に置き換える。変更した発言の数を返す。
+    置き換えた発言も引き続きAI校正の対象（手修正扱いにはしない）。赤字の区切りをまたぐ場合は、
+    その発言の赤字を解除して本文を正とする。"""
+    if not wrong or wrong == right:
+        return 0
+    changed = 0
+    for u in utterances:
+        text = u.get("text", "")
+        if wrong not in text:
+            continue
+        new_text = text.replace(wrong, right)
+        marked = u.get("marked") or text
+        new_marked = marked.replace(wrong, right)
+        if strip_marks(new_marked) != new_text:
+            new_marked = new_text
+        u["text"], u["marked"] = new_text, new_marked.replace(RED_OPEN + RED_CLOSE, "")
+        changed += 1
+    return changed
+
+
+def needs_review(u: dict) -> bool:
+    """聞き取りが不明瞭（赤字）・AI校正の再確認がある発言か"""
+    return RED_OPEN in (u.get("marked") or "") or bool(u.get("proofread_pending"))
+
+
+def next_review_index(utterances: list[dict], after: int) -> int | None:
+    """after（0始まり）より後で最初の要確認の発言。無ければ先頭から探す。見つからなければ None"""
+    n = len(utterances)
+    if not n:
+        return None
+    for k in range(1, n + 1):
+        i = (after + k) % n
+        if needs_review(utterances[i]):
+            return i
+    return None
+
+
 def rename_speaker(utterances: list[dict], old: str, new: str) -> int:
     n = 0
     for u in utterances:
@@ -593,6 +639,9 @@ button.st-time{background:transparent;border:0;padding:4px 0;text-align:left}
 .st-review-position{font-size:13px}
 .st-legend{font-size:12px;color:var(--body-text-color-subdued,#71717a);margin-bottom:8px}
 .st-player{width:100%;margin:0 0 10px}
+.st-edit-link{margin-left:10px;padding:0 8px;font-size:12px;line-height:20px;border:1px solid var(--border-color-primary,#ccc);
+  border-radius:4px;background:var(--background-fill-secondary,#f8fafc);color:inherit;cursor:pointer;font-family:inherit}
+.st-edit-link:hover{border-color:#b45309;color:#b45309}
 
 </style>
 """
@@ -652,9 +701,17 @@ def render_html(utterances: list[dict], audio_url: str = "") -> str:
         review = needs_review(r)
         badge = ('<span class="st-review-badge">AI校正の再確認</span>' if r["review_pending"] else
                  '<span class="st-review-badge">要確認</span>') if review else ""
+        # 「✎ 修正」で、その発言を「修正」タブの1件ずつの編集欄に開く（番号を window に置いて、
+        # 画面外の Gradio ボタン #st-item-pick-btn を押す。ボタン側の js が値を Gradio に渡す）
+        pick_js = html.escape(
+            f"window.stPickedItem='{r['utterance_index']}|'+Date.now();"
+            "var b=document.querySelector('#st-item-pick-btn');"
+            "if(b){(b.tagName==='BUTTON'?b:b.querySelector('button')).click();}", quote=True)
+        edit_btn = (f'<button type="button" class="st-edit-link" onclick="{pick_js}" '
+                    f'aria-label="発言{r["utterance_index"]}を修正">✎ 修正</button>')
         out.append(f'<div class="st-u{turn}" tabindex="-1" role="group" data-review="{str(review).lower()}" '
                    f'aria-label="発言{r["utterance_index"]}{" 要確認" if review else ""}">'
-                   f'<div class="st-no">発言 {r["utterance_index"]}{badge}</div>')
+                   f'<div class="st-no">発言 {r["utterance_index"]}{badge}{edit_btn}</div>')
         tag = "button" if audio_url else "div"
         attrs = f' type="button" aria-label="{format_hms(r["start"])}から再生"' if audio_url else ""
         out.append(f'<{tag} class="st-time"{attrs}{onclick}>{format_srt_time(r["start"])} --&gt; '

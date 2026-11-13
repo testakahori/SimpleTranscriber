@@ -19,8 +19,11 @@ DEFAULTS = {
         "ollama_model": "hf.co/unsloth/gemma-4-31B-it-GGUF:UD-IQ3_XXS",
         "ollama_num_gpu": 99,          # 全層をGPUへ（Ollamaの自動見積もりは控えめで一部CPUに逃がすため）
         "ollama_think": False,         # 思考モード（議事録の質↑・時間↑）
-        "ollama_max_ctx": 16384,       # これを超える長い会議は区間ごとに要約してから議事録化
+        # これを超える長い会議は区間ごとに要約してから議事録化。31B 3bit版は 16GB VRAM で
+        # 32768 でも全層GPU・24 tok/s（2026-11-13 実測）。約2時間の会議までメモ圧縮なしで入る
+        "ollama_max_ctx": 32768,
         "ollama_fallback_model": "gemma4:12b-it-qat",  # メモリ不足で動かない時の代替
+        "verify_documents": True,      # 議事録・要約の作成後に、各項目を文字起こしと照合して直す
     },
     "whisper": {
         "model": "auto",  # auto | large-v3 | large-v3-turbo | kotoba-whisper-v2.0 | medium | small

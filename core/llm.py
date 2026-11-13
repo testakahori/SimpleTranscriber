@@ -15,18 +15,45 @@ def provider_label(settings: dict) -> str:
     return f"Ollama ({settings.get('llm', {}).get('ollama_model')})"
 
 
-def generate(settings: dict, system: str, user_text: str, think: bool | None = None) -> str:
+DEFAULT_TEMPERATURE = 0.3
+# 日本語1文字あたりのトークン数の見積もり。gemma4 の実測（2026-11-13、議事録プロンプト＋技術文書
+# 2000字/6000字を Ollama の prompt_eval_count で確認）は 0.58〜0.61 トークン/文字。
+# 話し言葉・時刻・話者名が混ざる文字起こしは効率が落ちるので、安全側に 0.8 を使う。
+# （以前は 1.1 倍＋出力分 8192 で見積もっていたため、上限 16384 では約4400字しか入らず、
+#   10分を超える会議はすべて区間メモに圧縮され、しかもメモ用の区切り（18000字）が
+#   上限を超えて先頭が黙って切り捨てられていた）
+TOKENS_PER_CHAR = 0.8
+OUTPUT_RESERVE = 6144  # 生成分のために空けておくトークン数（議事録1本は実測で3000〜5000トークン）
+
+
+def generate(settings: dict, system: str, user_text: str, think: bool | None = None,
+             temperature: float | None = None, output_reserve: int = OUTPUT_RESERVE) -> str:
     """Ollama でテキスト生成する。失敗時は LLMError を送出。
 
     think: Ollamaの思考モード。None なら設定値（ollama_think）に従う。
+    temperature: 事実の書き写し（校正・議事録・照合）は低め（0.1）、考察は既定（0.3）。
+    output_reserve: この呼び出しの出力に見込むトークン数（コンテキスト長の見積もりに使う）。
     """
-    return _generate_ollama(settings, system, user_text, think)
+    return _generate_ollama(settings, system, user_text, think, temperature, output_reserve)
 
 
-def fits_context(settings: dict, system: str, user_text: str) -> bool:
+def max_ctx(settings: dict) -> int:
+    return int(settings["llm"].get("ollama_max_ctx") or 65536)
+
+
+def estimate_tokens(text: str) -> int:
+    return int(len(text) * TOKENS_PER_CHAR)
+
+
+def input_budget_chars(settings: dict, system: str, output_reserve: int = OUTPUT_RESERVE) -> int:
+    """system を除いて、ユーザー入力に使える文字数（上限に収まる最大）"""
+    tokens = max_ctx(settings) - output_reserve - estimate_tokens(system) - 64
+    return max(0, int(tokens / TOKENS_PER_CHAR))
+
+
+def fits_context(settings: dict, system: str, user_text: str, output_reserve: int = OUTPUT_RESERVE) -> bool:
     """Ollamaのコンテキスト上限に収まるか（収まらないと先頭が黙って切り捨てられる）"""
-    max_ctx = int(settings["llm"].get("ollama_max_ctx") or 65536)
-    return int((len(system) + len(user_text)) * 1.1) + 8192 <= max_ctx
+    return len(user_text) <= input_budget_chars(settings, system, output_reserve)
 
 
 def _is_resource_error(resp) -> bool:
@@ -81,17 +108,29 @@ def pop_fallback_notice() -> str:
     return f"メモリ不足のため一部を軽いモデルで処理しました（{msg}）"
 
 
-def _num_ctx(settings: dict, system: str, user_text: str) -> int:
-    """入力長から必要なコンテキスト長を見積もる（日本語は概ね1文字≒1トークン）"""
-    max_ctx = int(settings["llm"].get("ollama_max_ctx") or 65536)
-    need = int((len(system) + len(user_text)) * 1.1) + 8192  # 出力分の余裕
-    ctx = 16384  # 下限を揃えて処理ごとのモデル再読み込み（遅い＋メモリ負荷）を避ける
-    while ctx < need and ctx < max_ctx:
+_ctx_in_use: dict = {}  # モデル名 → このプロセスで使った最大のコンテキスト長
+
+
+def _num_ctx(settings: dict, system: str, user_text: str, output_reserve: int = OUTPUT_RESERVE) -> int:
+    """入力長から必要なコンテキスト長を見積もる。上限（ollama_max_ctx）を超える入力は
+    呼び出し側で分割する前提（超えると Ollama が先頭を黙って切り捨てる）。
+    一度大きいコンテキストで読み込んだら、以後の呼び出しも同じ長さにそろえる
+    （議事録 32768 → 照合 16384 のように変わるたびに Ollama がモデルを読み直して遅くなる）"""
+    limit = max_ctx(settings)
+    need = estimate_tokens(system + user_text) + output_reserve
+    ctx = min(16384, limit)  # 下限を揃えて処理ごとのモデル再読み込み（遅い＋メモリ負荷）を避ける
+    while ctx < need and ctx < limit:
         ctx *= 2
-    return min(ctx, max_ctx)
+    if need > limit:
+        logging.warning(f"LLMへの入力（約{need}トークン）が上限 {limit} を超えています。先頭が切り捨てられる可能性があります")
+    model = settings["llm"].get("ollama_model", "")
+    ctx = max(min(ctx, limit), min(_ctx_in_use.get(model, 0), limit))
+    _ctx_in_use[model] = ctx
+    return ctx
 
 
-def _generate_ollama(settings: dict, system: str, user_text: str, think: bool | None = None) -> str:
+def _generate_ollama(settings: dict, system: str, user_text: str, think: bool | None = None,
+                     temperature: float | None = None, output_reserve: int = OUTPUT_RESERVE) -> str:
     llm = settings["llm"]
     url = (llm.get("ollama_url") or "http://localhost:11434").rstrip("/")
     model = llm.get("ollama_model") or "gemma4:31b"
@@ -106,7 +145,8 @@ def _generate_ollama(settings: dict, system: str, user_text: str, think: bool | 
         "stream": False,
         "think": think,
         "keep_alive": "10m",
-        "options": {"num_ctx": _num_ctx(settings, system, user_text), "temperature": 0.3},
+        "options": {"num_ctx": _num_ctx(settings, system, user_text, output_reserve),
+                    "temperature": DEFAULT_TEMPERATURE if temperature is None else float(temperature)},
     }
     if llm.get("ollama_num_gpu") not in (None, ""):
         payload["options"]["num_gpu"] = int(llm["ollama_num_gpu"])

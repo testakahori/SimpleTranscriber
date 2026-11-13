@@ -65,10 +65,12 @@ def unload() -> None:
     _pya_pipeline = None
     try:
         import gc
-
-        import torch
+        import sys
         gc.collect()
-        if torch.cuda.is_available():
+        # torch をまだ読み込んでいないプロセス（GPU処理は別プロセスで行う今のアプリ本体）で
+        # ここから torch を読み込むと、初回のAI校正ボタンが数秒〜数十秒止まるので触らない
+        torch = sys.modules.get("torch")
+        if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
         pass
@@ -386,6 +388,205 @@ def _assign_words(segments: list[dict], label_at) -> dict:
     return word_speakers
 
 
+# ---------------------------------------------------------------------
+# 登録済みの声紋で、発言のまとまりごとに話者を見直す
+# ---------------------------------------------------------------------
+# 話者分離（pyannote・自前の両方）は「声の似た2人」（例: 女性2人）を1つの話者にまとめることがある。
+# 1クラスタには1人しか名前を付けられないため、もう1人の発言はその人の名前で出てしまう。
+# ここでは 2.5秒以上の発言のまとまりごとに声紋を取り、登録済みの別の人物にはっきり近い
+# （しきい値＋0.05 以上、今の人物より 0.10 以上近い）区間が合計6秒・2区間以上あれば付け替える。
+
+REFINE_MIN_SEC = 2.5
+REFINE_MARGIN = 0.10
+REFINE_MIN_TOTAL_SEC = 6.0
+REFINE_MIN_RUNS = 2
+REFINE_MAX_CHUNK_SEC = 20.0
+LAST_STATS: dict = {}  # 直近の diarize() の付け替え数など（UI表示用）
+
+
+def _speaker_runs(segments: list[dict], word_speakers: dict) -> list[tuple]:
+    """単語ごとの話者ラベル → 同じ話者が続く区間 [(seg_idx, 語lo, 語hi, 開始, 終了, ラベル)]"""
+    runs = []
+    for si, seg in enumerate(segments):
+        labels = word_speakers.get(si) or []
+        words = seg.get("words") or []
+        if not labels:
+            continue
+        if not words or len(labels) != len(words):
+            runs.append((si, 0, len(labels) - 1, seg["start"], seg["end"], labels[0]))
+            continue
+        k = 0
+        while k < len(labels):
+            j = k
+            while j + 1 < len(labels) and labels[j + 1] == labels[k]:
+                j += 1
+            runs.append((si, k, j, words[k]["start"], words[j]["end"], labels[k]))
+            k = j + 1
+    return runs
+
+
+def _refine_with_voiceprints(data, segments: list[dict], word_speakers: dict,
+                             match_similarity: float, own_centroids: dict | None = None) -> tuple[int, dict]:
+    """登録済み声紋が2人以上ある時、発言のまとまりごとに照合して明確な別人を付け替える。
+    own_centroids: {表示名: その話者クラスタの代表声紋}。今のクラスタの代表よりも REFINE_MARGIN 以上
+    別人物に近い時だけ付け替える（未登録の話者Aの区間が、似た登録人物に部分的に奪われるのを防ぐ）。
+    失敗してもこの見直しだけを諦め、話者分離の結果は保つ。
+    Returns: (付け替えた区間数, {人物名: 類似度} 付け替えで一致した人物)"""
+    try:
+        return _refine_with_voiceprints_impl(data, segments, word_speakers, match_similarity, own_centroids or {})
+    except Exception as e:
+        logging.warning(f"声紋による話者の見直しに失敗したため、話者分離の結果をそのまま使います: {e}")
+        return 0, {}
+
+
+def _refine_with_voiceprints_impl(data, segments, word_speakers, match_similarity, own_centroids):
+    groups = load_voiceprint_groups()
+    if len(groups) < 2:
+        return 0, {}
+    import numpy as np
+
+    runs = [r for r in _speaker_runs(segments, word_speakers) if r[4] - r[3] >= REFINE_MIN_SEC]
+    chunks, targets = [], []
+    for r in runs:
+        a = int(r[3] * SAMPLE_RATE)
+        b = min(int(min(r[4], r[3] + REFINE_MAX_CHUNK_SEC) * SAMPLE_RATE), len(data))
+        if b - a >= int(REFINE_MIN_SEC * SAMPLE_RATE * 0.8):
+            chunks.append(data[a:b])
+            targets.append(r)
+    if not chunks:
+        return 0, {}
+    vecs = _embed_chunks(chunks, batch_size=16)
+    mats = {name: np.stack(v) for name, v in groups.items()}
+    owns = {}
+    for label, cent in own_centroids.items():
+        c = np.asarray(cent, dtype="float32").reshape(-1)
+        if len(c) == vecs.shape[1]:
+            owns[label] = c / (np.linalg.norm(c) or 1.0)
+    proposals: dict = {}
+    for r, vec in zip(targets, vecs):
+        scores = {name: float((mat @ vec).max()) for name, mat in mats.items()}
+        best = max(scores, key=scores.get)
+        cur = r[5]
+        if best == cur or scores[best] < match_similarity + 0.05:
+            continue
+        if cur in scores:
+            if scores[best] - scores[cur] < REFINE_MARGIN:
+                continue
+        else:  # 今の話者は未登録（話者A など）: 2番目の人物よりはっきり近い時だけ
+            ranked = sorted(scores.values(), reverse=True)
+            if len(ranked) > 1 and ranked[0] - ranked[1] < REFINE_MARGIN:
+                continue
+        if cur in owns and scores[best] - float(owns[cur] @ vec) < REFINE_MARGIN:
+            continue  # 今のクラスタの代表と同じくらい近い＝その話者本人の声と区別できない
+        proposals.setdefault((cur, best), []).append((r, scores[best]))
+    changed, matched = 0, {}
+    for (cur, best), items in proposals.items():
+        total = sum(r[4] - r[3] for r, _ in items)
+        if len(items) < REFINE_MIN_RUNS or total < REFINE_MIN_TOTAL_SEC:
+            continue
+        for r, sim in items:
+            labels = word_speakers[r[0]]
+            for k in range(r[1], min(r[2], len(labels) - 1) + 1):
+                labels[k] = best
+            changed += 1
+            matched[best] = max(matched.get(best, 0.0), round(sim, 3))
+        logging.info(f"声紋で話者を見直し: {cur} → {best}（{len(items)}区間・{total:.0f}秒）")
+    return changed, matched
+
+
+def cluster_candidates(cluster_embeddings: dict, top: int = 3) -> dict:
+    """話者ごとの声紋（結果フォルダの speaker_clusters.json）を登録済みの人物と照合し、
+    近い順に {話者ラベル: [(人物, 類似度), ...]} を返す。GPU・モデル不要（numpyのみ）。
+    「話者に名前を付ける」で、どの登録人物に近いかの目安として表示する。"""
+    groups = load_voiceprint_groups()
+    if not groups or not cluster_embeddings:
+        return {}
+    import numpy as np
+
+    out = {}
+    for label, vec in cluster_embeddings.items():
+        try:
+            v = np.asarray(vec, dtype="float32").reshape(-1)
+            v = v / (np.linalg.norm(v) or 1.0)
+            scores = sorted(((name, float(max(float(v @ g) for g in vecs))) for name, vecs in groups.items()
+                             if len(vecs) and len(vecs[0]) == len(v)), key=lambda x: -x[1])
+        except Exception:
+            continue
+        out[label] = [(name, round(s, 2)) for name, s in scores[:top]]
+    return out
+
+
+def split_speaker(wav_path: str, utterances: list[dict], speaker: str, k: int = 2,
+                  match_similarity: float = 0.55) -> dict:
+    """1つの話者ラベルの発言を、声紋で k 人に分け直す（声の似た2人が1人にまとめられた時用）。
+    発言ごとに声紋を取り k-means で分け、いちばん大きい組は元の名前のまま、残りは
+    「<名前>（2）」のように番号を付ける。登録済みの人物にしきい値以上で近い組には、その名前を付ける。
+    Returns: {"labels": {発言index: 新ラベル}, "names": [ラベル...], "counts": {ラベル: 発言数},
+              "candidates": {ラベル: [(人物, 類似度)]}, "separation": 組同士の類似度（高いほど似ていて分けにくい）}"""
+    import numpy as np
+    from sklearn.cluster import KMeans
+
+    data = _load_wav(wav_path)
+    idxs = [i for i, u in enumerate(utterances) if u.get("speaker") == speaker]
+    if len(idxs) < k * 2:
+        raise ValueError(f"「{speaker}」の発言が {len(idxs)} 件しかなく、{k}人に分けられません")
+    chunks, embedded = [], []
+    for i in idxs:
+        u = utterances[i]
+        a = int(u["start"] * SAMPLE_RATE)
+        b = min(int(min(u["end"], u["start"] + REFINE_MAX_CHUNK_SEC) * SAMPLE_RATE), len(data))
+        if b - a >= int(0.5 * SAMPLE_RATE):
+            chunks.append(data[a:b])
+            embedded.append(i)
+    if len(embedded) < k * 2:
+        raise ValueError("0.5秒以上の発言が少なすぎて分けられません")
+    vecs = _embed_chunks(chunks, batch_size=16)
+    durations = np.array([utterances[i]["end"] - utterances[i]["start"] for i in embedded])
+    long_mask = durations >= 1.0
+    fit = vecs[long_mask] if long_mask.sum() >= k * 2 else vecs
+    labels_fit = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(fit)
+    cents = np.stack([_mean_unit(fit[labels_fit == c]) if (labels_fit == c).any() else fit.mean(axis=0)
+                      for c in range(k)])
+    labels = (vecs @ cents.T).argmax(axis=1)  # 短い発言も含めて重心に割り当て直す
+    order = [c for c in sorted(range(k), key=lambda c: -(labels == c).sum()) if (labels == c).any()]  # 空の組は除く
+    groups = load_voiceprint_groups()
+    cands = {}
+    for c in order:
+        cands[c] = sorted(((n, float(max(float(cents[c] @ g) for g in vecs_))) for n, vecs_ in groups.items()),
+                          key=lambda x: -x[1])[:3] if groups else []
+    # 元の名前は、その人物の登録声紋にいちばん近い組に付ける（登録があれば）。無ければいちばん大きい組
+    keep = order[0]
+    if speaker in groups:
+        keep = max(order, key=lambda c: next((sim for n, sim in cands[c] if n == speaker), -1.0))
+    taken = {u.get("speaker") for u in utterances if u.get("speaker")}  # 既にある「名前（2）」と重ねない
+    names, used, suffix = {}, {speaker}, 2
+    for c in [keep] + [c for c in order if c != keep]:
+        cand = cands[c]
+        matched_name = (cand[0][0] if cand and cand[0][1] >= match_similarity
+                        and cand[0][0] not in used and cand[0][0] not in taken else None)
+        if c == keep and (speaker in groups or not matched_name):
+            name = speaker  # 登録済みの本人の組、または登録人物に近い組が無い時の大きい組
+        elif matched_name:
+            name = matched_name
+        else:
+            while f"{speaker}（{suffix}）" in taken or f"{speaker}（{suffix}）" in used:
+                suffix += 1
+            name = f"{speaker}（{suffix}）"
+            suffix += 1
+        used.add(name)
+        names[c] = (name, [(n, round(sim, 2)) for n, sim in cand])
+    result_labels = {i: names[int(c)][0] for i, c in zip(embedded, labels)}
+    majority = names[order[0]][0]
+    for i in idxs:  # 声紋を取れなかったごく短い発言は、いちばん大きい組へ
+        result_labels.setdefault(i, majority)
+    counts = {}
+    for lab in result_labels.values():
+        counts[lab] = counts.get(lab, 0) + 1
+    separation = max((float(cents[a] @ cents[b]) for a in order for b in order if a < b), default=0.0)
+    return {"labels": result_labels, "names": [names[c][0] for c in order], "counts": counts,
+            "candidates": {names[c][0]: names[c][1] for c in order}, "separation": round(separation, 3)}
+
+
 def diarize(wav_path: str, segments: list[dict], num_speakers: int = 0,
             max_speakers: int = 12, match_similarity: float = 0.55,
             hf_token: str = "", progress_cb=None):
@@ -402,6 +603,7 @@ def diarize(wav_path: str, segments: list[dict], num_speakers: int = 0,
     """
     if not available():
         return {}, {}, {}
+    LAST_STATS.clear()
     if hf_token and pyannote_available():
         try:
             return _diarize_pyannote(wav_path, segments, num_speakers, max_speakers,
@@ -465,9 +667,11 @@ def _diarize_spectral(wav_path, segments, num_speakers, max_speakers, match_simi
 
         word_speakers = _assign_words(segments, label_at)
         _recheck_long_segments(data, segments, word_speakers, centroids, cluster_names)
-
         cluster_embeddings = {cluster_names[cid]: centroids[cid] for cid in centroids}
-        logging.info(f"話者分離完了(声紋クラスタリング): {len(centroids)}名 / 照合={matched}")
+        refined, extra = _refine_with_voiceprints(data, segments, word_speakers, match_similarity, cluster_embeddings)
+        matched.update(extra)
+        LAST_STATS.update(refined=refined)
+        logging.info(f"話者分離完了(声紋クラスタリング): {len(centroids)}名 / 照合={matched} / 声紋で見直し={refined}区間")
         return word_speakers, cluster_embeddings, matched
     except Exception as e:
         logging.exception(f"話者分離に失敗したためスキップします: {e}")
@@ -590,7 +794,10 @@ def _diarize_pyannote(wav_path, segments, num_speakers, max_speakers, match_simi
 
     word_speakers = _assign_words(segments, label_at)
     cluster_embeddings = {cluster_names[spk]: vec for spk, vec in centroids.items()}
-    logging.info(f"話者分離完了(pyannote): {len(centroids)}名 / 発話区間{len(turns)} / 照合={matched}")
+    refined, extra = _refine_with_voiceprints(data, segments, word_speakers, match_similarity, cluster_embeddings)
+    matched.update(extra)
+    LAST_STATS.update(refined=refined)
+    logging.info(f"話者分離完了(pyannote): {len(centroids)}名 / 発話区間{len(turns)} / 照合={matched} / 声紋で見直し={refined}区間")
     return word_speakers, cluster_embeddings, matched
 
 
@@ -776,15 +983,17 @@ def delete_voiceprint(name: str) -> bool:
 # 会議からの声紋学習（議事録を取るたびに、よい音声だけを選んで声紋に足す）
 # ---------------------------------------------------------------------
 
-UNNAMED_RE = re.compile(r"^(話者([A-Z]|\d+)|不明|unknown|)$")
+UNNAMED_RE = re.compile(r"^(話者([A-Z]|\d+)(-\d+)?|不明|unknown|)$")
+SPLIT_SUFFIX_RE = re.compile(r"(（\d+）|\(\d+\))$")  # 「話者を分ける」が付ける仮の番号（「岡田（2）」も学習しない）
 EDGE_SEC = 0.25          # 発言の頭と終わりは前後の人の声・息が混ざりやすいので削る
 CLIP_SEC = 3.0           # 声紋を取る1切れの長さ
 MIN_CLIP_SEC = 1.5
 
 
 def is_named(speaker: str) -> bool:
-    """「話者A」のような仮の名前ではなく、人の名前が付いているか"""
-    return not UNNAMED_RE.match((speaker or "").strip()) and validate_name(speaker or "") is None
+    """「話者A」「岡田（2）」のような仮の名前ではなく、人の名前が付いているか"""
+    name = (speaker or "").strip()
+    return not UNNAMED_RE.match(name) and not SPLIT_SUFFIX_RE.search(name) and validate_name(name) is None
 
 
 def _clean_clips(utterances: list[dict], duration: float) -> dict:
