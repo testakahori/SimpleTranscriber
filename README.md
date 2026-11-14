@@ -72,7 +72,7 @@ AI校正で回答が欠けた行や不適切な回答だった行は元の本文
 
 初回はライブラリのダウンロードに数分から10分ほどかかります。NVIDIA GPUがあれば、CUDA版のPyTorchも自動で入ります。準備ができるとブラウザで `http://127.0.0.1:7860` が開きます。
 
-2回目以降は、`requirements.txt` が前回の導入時から変わっていなければライブラリの確認を飛ばして数秒で起動します。ライブラリを入れ直したい時は `run.bat --check` で起動するか、`venvequirements.installed` を削除してください。GPUの有無の確認は別プロセスで行い、結果を `output/.device_probe.json` に覚えます（GPUを載せ替えた時はこのファイルを削除）。
+2回目以降は、`requirements.txt` が前回の導入時から変わっていなければライブラリの確認を飛ばして数秒で起動します。ライブラリを入れ直したい時は `run.bat --check` で起動するか、`venv\requirements.installed` を削除してください。GPUの有無の確認は別プロセスで行い、結果を `output/.device_probe.json` に覚えます（GPUを載せ替えた時はこのファイルを削除）。
 
 ## LLM（gemma4）の準備
 
