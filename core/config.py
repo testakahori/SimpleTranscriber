@@ -24,6 +24,7 @@ DEFAULTS = {
         "ollama_max_ctx": 32768,
         "ollama_fallback_model": "gemma4:12b-it-qat",  # メモリ不足で動かない時の代替
         "verify_documents": True,      # 議事録・要約の作成後に、各項目を文字起こしと照合して直す
+        "yomiyasu": True,              # 意味保持を優先した読みやすさの原則を文書生成に組み込む
     },
     "whisper": {
         "model": "auto",  # auto | large-v3 | large-v3-turbo | kotoba-whisper-v2.0 | medium | small

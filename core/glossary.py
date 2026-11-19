@@ -65,6 +65,8 @@ def save_corrections(corrections: list[dict]) -> None:
 
 def learn_from_diff(before: str, after: str) -> int:
     """編集前後の差分から「誤→正」ペアを抽出して学習する。学習件数を返す。"""
+    # 1文字の漢字修正も、文脈ごとAI校正の参考に残す。無条件置換には昇格させない。
+    contextual = remember_context(before, after)
     corrections = load_corrections()
     index = {(c.get("wrong"), c.get("right")): c for c in corrections}
 
@@ -89,7 +91,62 @@ def learn_from_diff(before: str, after: str) -> int:
 
     if learned:
         save_corrections(corrections)
-    return learned
+    return learned or int(contextual)
+
+
+def load_context_examples() -> list[dict]:
+    path = LEARNED_PATH.with_name("context_examples.yaml")
+    if not path.exists():
+        return []
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return [e for e in data.get("examples", []) if isinstance(e, dict)
+            and isinstance(e.get("before"), str) and isinstance(e.get("after"), str)]
+
+
+def save_context_examples(examples: list[dict]) -> None:
+    from . import output
+    path = LEARNED_PATH.with_name("context_examples.yaml")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(path.parent, path.name, yaml.safe_dump({"examples": examples}, allow_unicode=True, sort_keys=False))
+
+
+def remember_context(before: str, after: str) -> bool:
+    """人の短い修正を文脈付きで保持。家電→架電の「家→架」も単独置換しない。"""
+    if not before or not after or before == after or max(len(before), len(after)) > 300:
+        return False
+    if difflib.SequenceMatcher(None, before, after, autojunk=False).ratio() < 0.5:
+        return False
+    examples = load_context_examples()
+    if any(e["before"] == before and e["after"] == after for e in examples):
+        return False
+    examples.append({"before": before, "after": after, "context": "人が修正した発言。同じ話題・意味の場合にだけ参考にする。"})
+    save_context_examples(examples)
+    return True
+
+
+def context_hints(text: str, limit: int = 12, max_chars: int = 2000) -> str:
+    """現在の校正区間に近い例だけを渡す。辞書の正解を文脈なしで押し付けない。"""
+    def bigrams(s):
+        return {s[i:i + 2] for i in range(len(s) - 1) if not _PUNCT_CHARS & set(s[i:i + 2])}
+    target = bigrams(text)
+    scored = []
+    for e in load_context_examples():
+        before, after = e["before"].strip(), e["after"].strip()
+        if not before or not after or max(len(before), len(after)) > 300:
+            continue
+        score = len(bigrams(before) & target) + (20 if before in text else 0)
+        if score:
+            scored.append((score, before, after, str(e.get("context", ""))[:200]))
+    if not scored:
+        return ""
+    header = "\n\n# 文脈付きの修正例（機械的に置換しない。同じ意味の文脈でだけ参考にする）\n"
+    selected, size = [], len(header)
+    for _, before, after, context in sorted(scored, reverse=True)[:limit]:
+        entry = f"- 修正前: {before}\n  修正後: {after}\n  適用場面: {context}"
+        if size + len(entry) + 1 <= max_chars:
+            selected.append(entry)
+            size += len(entry) + 1
+    return header + "\n".join(selected) if selected else ""
 
 
 def learn_pair(wrong: str, right: str, promote: bool = False) -> bool:
