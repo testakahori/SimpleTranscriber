@@ -1,8 +1,9 @@
 """LLMによる文書生成: 校正（赤字補完）・議事録・要約と考察・文字起こしとの照合"""
+import json
 import logging
 import re
 
-from . import glossary, llm, people
+from . import glossary, llm, people, text_fidelity
 from .config import PROMPTS_DIR
 from .utterances import RED_CLOSE, RED_OPEN, RED_RE, format_hms, strip_marks
 
@@ -33,6 +34,7 @@ def _context_block(memo: str = "") -> str:
         block += "\n\n# 用語辞書（この表記を正とする）\n" + "、".join(terms)
     if memo and memo.strip():
         block += "\n\n# 会議の背景メモ（人が書いた議題・参加者・背景。固有名詞や文脈の手掛かりにする）\n" + memo.strip()
+    block += "\n\n人物マスタと用語辞書は表記の参考であり、発言・担当・決定の根拠ではない。会議メモも発言の代わりにしない。"
     return block
 
 
@@ -63,7 +65,7 @@ def _mistake_hints() -> str:
     if not pairs:
         return ""
     pairs.sort(key=lambda x: -x[0])
-    return ("\n\n# 過去に人が直した誤変換の例（同じ語が出たら正の表記にする）\n"
+    return ("\n\n# 過去の誤変換候補（同じ話題・意味の場合だけ参考にする。別の意味で正しい語を置換しない）\n"
             + "、".join(f"{w}→{r}" for _, w, r in pairs[:MISTAKE_HINTS]))
 
 
@@ -77,6 +79,7 @@ def proofread_utterances(settings: dict, utterances: list[dict], progress_cb=Non
     memo: 会議メモ（議題・参加者）。同音異義語を文脈で選ぶ手掛かりになる
     """
     system = _load_prompt(PROOFREAD_PROMPT) + _context_block(memo) + _mistake_hints()
+    names = text_fidelity.name_map(people.load_people(), (u.get("speaker", "") for u in utterances))
 
     chunks, cur, size = [], [], 0
     for i, u in enumerate(utterances):
@@ -110,7 +113,8 @@ def proofread_utterances(settings: dict, utterances: list[dict], progress_cb=Non
         if ctx_after:
             user += f"\n\n（参考: 直後の発言）{ctx_after}"
         try:
-            reply = llm.generate(settings, system, user, think=False, temperature=FACTUAL_TEMPERATURE)
+            chunk_system = system + glossary.context_hints(user)
+            reply = llm.generate(settings, chunk_system, user, think=False, temperature=FACTUAL_TEMPERATURE)
         except llm.LLMError:
             raise
         except Exception as e:
@@ -139,6 +143,10 @@ def proofread_utterances(settings: dict, utterances: list[dict], progress_cb=Non
             if _drops_content(u["text"], new_text):
                 logging.info(f"校正で発言内容が削除されたため不採用: {u['text'][:40]}")
                 continue
+            if text_fidelity.correction_changes_facts(u["text"], new_text, names):
+                logging.info("校正が人物・数値・否定や未確定表現を変更したため保留: 発言%d", n + 1)
+                continue
+            new_marked = text_fidelity.mark_corrections(u.get("marked") or u["text"], new_marked)
             if new_text != u["text"]:
                 changed += 1
             u["marked"], u["text"] = new_marked, new_text
@@ -195,6 +203,7 @@ NOTES_SYSTEM = """あなたは会議の書記です。渡されるのは長い�
 後で議事録にまとめるための「詳細メモ」を作ってください。このメモは文字起こしの代わりに使われるので、意味を変えないことが最優先です。
 - 話題ごとに、誰が何を報告・提案・質問・回答・反対したかを、発言の時刻 [hh:mm:ss] 付きで漏れなく箇条書きにする
 - 決定事項、担当者と期限つきの依頼、未確定・保留の事項、数字・金額・日付・固有名詞は必ず残す
+- 担当者が複数なら全員を同じ組で残す。発言者・依頼者・報告者と実行担当者を区別し、担当を述べた原文を引用する
 - 重要な発言（決定・依頼・数字・反対意見・条件）は要約せず、発言のまま「」で引用する
 - 否定（〜ない）・条件（〜なら、〜の場合）・推量（〜かもしれない）・質問か断定かを落とさない。誰の主張かを取り違えない
 - 赤字（<span style="color:red">〜</span>）の箇所は赤字のまま残す
@@ -297,7 +306,7 @@ def _template_block() -> str:
 
 def generate_minutes(settings: dict, transcript: str, source_name: str = "",
                      meeting_date: str = "", memo: str = "", progress_cb=None) -> str:
-    system = _load_prompt(MINUTES_PROMPT) + _template_block() + _context_block(memo)
+    system = _load_prompt(MINUTES_PROMPT) + _template_block() + _context_block(memo) + _readability_rules(settings)
     transcript = _shrink_transcript(settings, system, transcript, progress_cb)
     if progress_cb:
         progress_cb(0.9, "議事録を作成中...")
@@ -326,7 +335,7 @@ def tidy_minutes(md: str) -> str:
 
 def generate_insights(settings: dict, transcript: str, source_name: str = "",
                       meeting_date: str = "", memo: str = "", progress_cb=None) -> str:
-    system = _load_prompt(INSIGHTS_PROMPT) + _context_block(memo)
+    system = _load_prompt(INSIGHTS_PROMPT) + _context_block(memo) + _readability_rules(settings)
     transcript = _shrink_transcript(settings, system, transcript, progress_cb)
     if progress_cb:
         progress_cb(0.9, "要約と考察を作成中...")
@@ -342,6 +351,12 @@ def _strip_code_fence(text: str) -> str:
         if lines[0].startswith("```") and lines[-1].strip() == "```":
             return "\n".join(lines[1:-1]).strip()
     return stripped
+
+
+def _readability_rules(settings):
+    if not settings.get("llm", {}).get("yomiyasu", True):
+        return ""
+    return "\n\n" + _load_prompt("yomiyasu_議事録向け.md")
 
 
 # =====================================================================
@@ -360,6 +375,8 @@ EVIDENCE_MAX_CHARS = 1400
 VERIFY_BATCH_ITEMS = 6
 VERIFY_OUTPUT_RESERVE = 3072
 UNVERIFIED_MARK = "（文字起こしで確認できず）"
+REVIEW_MARK = "（要確認：原文との照合未完了）"
+_QUOTE_RE = re.compile(r"^\s*\[(\d+)\]\s*根拠\s*[:：]\s*(.+)$")
 
 # 判定の対象外（AIの所見・解釈・会議概要の形式項目）
 _SKIP_SECTIONS = ("AIの意見", "会議概要", "考察")
@@ -522,6 +539,48 @@ def _acceptable_fix(old: str, new: str, others=()) -> bool:
     return True
 
 
+def _quoted_attribution_supported(item, section, evidence, quotes, names):
+    """人名を含む項目は実在する発言引用で支える。近傍の話者名一覧だけでは担当の根拠にしない。"""
+    claimed = text_fidelity.names_in(item + " " + section, names)
+    if not claimed:
+        return True
+    if not isinstance(quotes, list) or not quotes or len(quotes) > 4:
+        return False
+    supported = set()
+    # 同じ人の別の仕事の引用を根拠に使わない。語が一致しない言い換えは要確認へ回す。
+    item_core = _EVIDENCE_NOTE_RE.sub("", item)
+    for alias in sorted(names, key=len, reverse=True):
+        item_core = item_core.replace(alias, "")
+    keys = _keywords(item_core) - {"担当者", "報告者", "期限", "未定"}
+    for quote in quotes:
+        if not isinstance(quote, dict):
+            return False
+        stamp, text = quote.get("time"), quote.get("quote")
+        if not isinstance(stamp, str) or not isinstance(text, str) or len(text.strip()) < 6:
+            return False
+        if keys and not any(k in text for k in keys):
+            return False
+        matched = False
+        for _, line in _transcript_lines(evidence):
+            m = re.match(r"^\[([^]]+)\]\s*([^:：]+)[:：]\s*(.*)$", strip_marks(line))
+            if not m or m.group(1) != stamp or text not in m.group(3):
+                continue
+            matched = True
+            supported.update(text_fidelity.names_in(text, names))
+            # 「私が送る」等は発言者を根拠にできる。他人についての報告では話者を担当にしない。
+            if re.search(r"私(?:が|は|も)|私たち(?:が|は)|こちら(?:で|が)", text):
+                supported.update(text_fidelity.names_in(m.group(2), names))
+            # 「Aから説明があった」は話者Aの引用で支えられる。実行担当の主張とは分ける。
+            for alias in names:
+                if alias == m.group(2) and re.search(re.escape(alias) + r"(?:から|が|は|による).{0,45}(?:報告|説明|発言|述べ|質問|提案)", item):
+                    supported.add(names[alias])
+        if not matched:
+            return False
+    if re.search(r"担当|対応|依頼|実行|送付|提出|手配|アクション", item + section) or item.strip().startswith("|"):
+        return claimed == supported  # 共同担当の一人だけを落とした候補も要確認にする。
+    return claimed <= supported
+
+
 def verify_document(settings: dict, transcript: str, md: str, memo: str = "",
                     progress_cb=None) -> tuple[str, dict]:
     """文書の各項目を文字起こしと照合して直す。(修正後の文書, 集計) を返す。
@@ -531,23 +590,43 @@ def verify_document(settings: dict, transcript: str, md: str, memo: str = "",
     （部分的な根拠で書き直させると内容が縮む）。"""
     lines = md.split("\n")
     items = _items_with_sections(md)
-    report = {"checked": 0, "fixed": 0, "unverified": 0, "skipped": 0, "failed": 0, "error": ""}
+    report = {"checked": 0, "fixed": 0, "unverified": 0, "skipped": 0, "failed": 0,
+              "pending": 0, "error": "", "items": []}
     if not items:
         return md, report
     evidence_lines = _transcript_lines(transcript)
-    system = _load_prompt(VERIFY_PROMPT) + _context_block(memo)
+    # 正式表記・背景メモは事実の根拠にしない。原文以外から担当者を選ばせない。
+    system = _load_prompt(VERIFY_PROMPT)
+    speakers = []
+    for _, line in evidence_lines:
+        m = re.match(r"^\[[^]]+\]\s*([^:：]+)[:：]", line)
+        if m and not people._PLACEHOLDER_RE.match(m.group(1)):
+            speakers.append(m.group(1))
+    names = text_fidelity.name_map(people.load_people(), speakers)
     budget = llm.input_budget_chars(settings, system, VERIFY_OUTPUT_RESERVE)
 
     entries = []
+    resolved = set()
+
+    def flag(li, prefix, body, mark, reason):
+        if mark not in body:
+            lines[li] = _keep_break(lines[li], _append_mark(prefix, body, mark))
+        report["pending" if mark == REVIEW_MARK else "unverified"] += 1
+        report["items"].append({"line": li + 1, "status": reason, "draft": body})
+        resolved.add(li)
+
     for n, (li, line, section) in enumerate(items, 1):
         prefix, body = _split_prefix(line)
         ev, how = _evidence(evidence_lines, body)
         if not ev:
             report["skipped"] += 1  # 根拠候補が探せない項目は判定しない（勝手に消さない）
+            if not any(k in section for k in _NO_UNVERIFIED_SECTIONS):
+                flag(li, prefix, body, REVIEW_MARK, "no_evidence")
             continue
         fixable = how == "time" and not any(k in section for k in _PARAGRAPH_SECTIONS)
         markable = not any(k in section for k in _NO_UNVERIFIED_SECTIONS)
-        entries.append((n, li, prefix, body, f"[{n}] 下書き: {body}\n根拠候補:\n{ev}", fixable, markable))
+        entries.append((n, li, prefix, body, f"[{n}] 下書き: {body}\n節: {section}\n根拠候補:\n{ev}",
+                        fixable, markable, section, ev))
 
     batches, cur, size = [], [], 0
     for e in entries:
@@ -575,23 +654,37 @@ def verify_document(settings: dict, transcript: str, md: str, memo: str = "",
             logging.warning(f"照合バッチ{bi}で失敗: {e}")
             report["failed"] += 1
             continue
-        verdicts = {}
+        verdicts, quotes, duplicate = {}, {}, set()
         for line in reply.splitlines():
+            qm = _QUOTE_RE.match(line)
+            if qm:
+                try:
+                    quotes[int(qm.group(1))] = json.loads(qm.group(2))
+                except (ValueError, TypeError):
+                    pass
+                continue
             m = _VERDICT_RE.match(line)
             if m:
-                verdicts.setdefault(int(m.group(1)), (m.group(2), m.group(3).strip()))
+                n = int(m.group(1))
+                if n in verdicts:
+                    duplicate.add(n)
+                verdicts[n] = (m.group(2), m.group(3).strip())
         bodies = [e[3] for e in batch]
-        for n, li, prefix, body, _, fixable, markable in batch:
-            if n not in verdicts:
+        for n, li, prefix, body, _, fixable, markable, section, ev in batch:
+            if n not in verdicts or n in duplicate:
                 continue
             kind, text = verdicts[n]
             report["checked"] += 1
             if kind in ("OK", "ＯＫ"):
+                if not _quoted_attribution_supported(body, section, ev, quotes.get(n), names):
+                    continue
+                resolved.add(li)
+                report["items"].append({"line": li + 1, "status": "matched", "quotes": quotes.get(n, [])})
                 continue
             if kind == "確認できず":
-                if markable and UNVERIFIED_MARK not in body:
-                    lines[li] = _keep_break(lines[li], _append_mark(prefix, body))
-                    report["unverified"] += 1
+                if markable:
+                    flag(li, prefix, body, UNVERIFIED_MARK, "unverified")
+                resolved.add(li)
                 continue
             if not fixable:
                 continue
@@ -601,8 +694,17 @@ def verify_document(settings: dict, transcript: str, md: str, memo: str = "",
                 fixed = fixed[len(prefix.strip()):].strip()
             if fixed == body or not _acceptable_fix(body, fixed, [b for b in bodies if b != body]):
                 continue
+            if not _quoted_attribution_supported(fixed, section, ev, quotes.get(n), names):
+                continue
             lines[li] = _keep_break(lines[li], prefix + fixed)
             report["fixed"] += 1
+            resolved.add(li)
+            report["items"].append({"line": li + 1, "status": "fixed", "draft": body,
+                                    "result": fixed, "quotes": quotes.get(n, [])})
+    # 欠落回答・失敗・不採用の修正案を「確認済み」に見せない。
+    for _, li, prefix, body, _, _, markable, _, _ in entries:
+        if li not in resolved and markable:
+            flag(li, prefix, body, REVIEW_MARK, "not_validated")
     return "\n".join(lines), report
 
 
@@ -613,15 +715,15 @@ def _keep_break(old_line: str, new_line: str) -> str:
     return new_line
 
 
-def _append_mark(prefix: str, body: str) -> str:
+def _append_mark(prefix: str, body: str, mark: str = UNVERIFIED_MARK) -> str:
     if body.strip().startswith("|"):
         cells = body.split("|")
         for k in range(1, len(cells) - 1):
             if cells[k].strip():
-                cells[k] = cells[k].rstrip() + UNVERIFIED_MARK + " "
+                cells[k] = cells[k].rstrip() + mark + " "
                 break
         return "|".join(cells)
-    return prefix + body.rstrip() + UNVERIFIED_MARK
+    return prefix + body.rstrip() + mark
 
 
 def verify_summary(report: dict) -> str:
@@ -631,7 +733,9 @@ def verify_summary(report: dict) -> str:
     if not report.get("checked"):
         if report.get("error") or report.get("failed"):
             reason = f"（{report['error']}）" if report.get("error") else ""
-            return f"文字起こしとの照合はAIの応答が得られず完了しませんでした{reason}。照合前の文書を保存しています。"
+            return f"文字起こしとの照合はAIの応答が得られず完了しませんでした{reason}。未完了の項目に要確認を付けて保存しています。"
+        if report.get("pending"):
+            return f"照合できなかった{report['pending']}項目に要確認を付けました。原文を確認してください。"
         return "照合できる項目がありませんでした。"
     msg = f"AIが{report['checked']}項目を文字起こしと照合"
     if report.get("fixed"):
@@ -641,6 +745,8 @@ def verify_summary(report: dict) -> str:
     if report.get("skipped"):
         msg += f"（{report['skipped']}項目は根拠候補を探せず未判定）"
     msg += "しました。"
+    if report.get("pending"):
+        msg += f" {report['pending']}項目は引用・回答・修正案を検証できず、要確認のままです。"
     if report.get("error"):
         msg += f" 途中でAIの応答が止まったため、残りの{report.get('failed', 0)}回分は照合していません（{report['error']}）。"
     elif report.get("failed"):

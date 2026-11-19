@@ -183,10 +183,10 @@ class ReviewWorkflowTest(unittest.TestCase):
 
 class ProofreadingTest(unittest.TestCase):
     def test_missing_rejected_duplicate_lines_are_not_marked_complete(self):
-        rows = [utterance(), utterance("長い発言を削除せずにそのまま残してください。", 4), utterance("これは最後の行です。", 8)]
+        rows = [utterance("開始は10じです。"), utterance("長い発言を削除せずにそのまま残してください。", 4), utterance("これは最後の行です。", 8)]
         with patch.object(minutes, "_load_prompt", return_value="prompt"), \
                 patch.object(minutes, "_context_block", return_value=""), \
-                patch.object(minutes.llm, "generate", return_value="[1] 話者1: 開始は11時です。\n[1] 重複の回答\n[2] はい"):
+                patch.object(minutes.llm, "generate", return_value="[1] 話者1: 開始は10時です。\n[1] 重複の回答\n[2] はい"):
             done, changed = minutes.proofread_utterances({}, rows)
         self.assertEqual((done, changed), (1, 1))
         self.assertTrue(rows[0]["proofread"])
@@ -197,7 +197,7 @@ class ProofreadingTest(unittest.TestCase):
     def test_redo_rechecks_ai_edits_but_preserves_human_edits(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
-            ai = utterance("開始は11時です。")
+            ai = utterance("開始は11じです。")
             ai.update(proofread=True, words=[dict(start=0, end=3, word="開始は10時です。", prob=1)])
             human = dict(utterance("確認済みです。", 5), human=True)
             job = dict(job_dir=str(folder), source="test.wav", utterances=[ai, human])
@@ -207,12 +207,12 @@ class ProofreadingTest(unittest.TestCase):
                     patch.object(app, "_save_job"), \
                     patch.object(minutes, "_load_prompt", return_value="prompt"), \
                     patch.object(minutes, "_context_block", return_value=""), \
-                    patch.object(minutes.llm, "generate", return_value="[1] 話者1: 開始は12時です。") as generate:
+                    patch.object(minutes.llm, "generate", return_value="[1] 話者1: 開始は11時です。") as generate:
                 result = app.proofread_job(job, True, progress=Mock())
             generate.assert_called_once()
-            self.assertEqual(result[1]["utterances"][0]["text"], "開始は12時です。")
+            self.assertEqual(result[1]["utterances"][0]["text"], "開始は11時です。")
             self.assertEqual(result[1]["utterances"][1], human)
-            self.assertEqual(job["utterances"][0]["text"], "開始は11時です。")
+            self.assertEqual(job["utterances"][0]["text"], "開始は11じです。")
 
 
 class ExportTablesTest(unittest.TestCase):

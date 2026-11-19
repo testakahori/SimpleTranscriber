@@ -1069,6 +1069,7 @@ def _make_doc(state, kind: str, progress, verify=None):
                            else ("要約と考察", "要約と考察.md", minutes.generate_insights))
     progress(0.1, desc=f"{label}を作成中...（長い会議は区間ごとのメモを作ってからまとめます）")
     verify_note = ""
+    report = {"enabled": bool(verify)}
     try:
         md = fn(settings, source["transcript"], source["source"], source["meeting_date"],
                 memo=job.get("memo", ""), progress_cb=lambda f, d: progress(0.1 + 0.5 * f, desc=d))
@@ -1082,10 +1083,13 @@ def _make_doc(state, kind: str, progress, verify=None):
                     settings, source["transcript"], md, memo=job.get("memo", ""),
                     progress_cb=lambda f, d: progress(0.65 + 0.3 * f, desc=d))
                 verify_note = "🔎 " + minutes.verify_summary(report)
+                report["enabled"] = True
             except Exception as e:
                 logging.warning(f"{label}の照合に失敗したため、照合前の文書を保存します: {e}")
                 verify_note = f"⚠️ 文字起こしとの照合は完了しませんでした（{e}）。照合前の{label}を保存しています。"
-        document_status.save(Path(job["job_dir"]), filename, md, source)
+                md = "> 要確認：原文との照合が完了していません。担当者・数値・決定事項を確認してください。\n\n" + md
+                report = {"enabled": True, "error": str(e)}
+        document_status.save(Path(job["job_dir"]), filename, md, source, verification=report)
         msg = f"✅ {label}を作成して保存しました。内容を確認してMarkdownをダウンロードできます。"
         if verify_note:
             msg += "\n\n" + verify_note
@@ -1390,6 +1394,24 @@ def load_corrections_table():
     rows = [[c.get("wrong", ""), c.get("right", ""), c.get("count", 1)]
             for c in glossary.load_corrections()]
     return rows or [["", "", 1]]
+
+
+def load_context_examples_table():
+    return [[e["before"], e["after"], e.get("context", "")]
+            for e in glossary.load_context_examples()] or [["", "", ""]]
+
+
+def save_context_examples_table(rows):
+    examples = []
+    for row in _rows(rows):
+        before, after, context = (_cell(row, i) for i in range(3))
+        if not before and not after:
+            continue
+        if not before or not after or max(len(before), len(after)) > 300 or len(context) > 200:
+            raise gr.Error("修正前と修正後を各300文字以内、使う文脈を200文字以内で入力してください。")
+        examples.append({"before": before, "after": after, "context": context})
+    glossary.save_context_examples(examples)
+    return "文脈付きの校正ヒントを保存しました。AI校正で参考にし、自動の一括置換には使いません。"
 
 
 def ollama_models(url: str) -> list[str]:
@@ -1822,8 +1844,18 @@ def build_ui():
                                           value="\n".join(glossary.load_glossary()))
                 glossary_save_btn = gr.Button("保存", variant="primary")
                 glossary_status = gr.Markdown()
+                gr.Markdown("### 文脈付きの校正ヒント")
+                gr.Markdown("「家電→架電」のような同音異義語は、使う文脈も登録してください。"
+                            "AI校正で参考にし、一律には置換しません。短い発言の手修正もここに蓄積します。")
+                context_examples_table = gr.Dataframe(headers=["修正前", "修正後", "使う文脈"],
+                    column_count=(3, "fixed"), interactive=True, wrap=True, value=load_context_examples_table())
+                with gr.Row():
+                    context_examples_save = gr.Button("文脈付きヒントを保存")
+                    context_examples_refresh = gr.Button("修正例を再読み込み")
+                context_examples_status = gr.Markdown()
                 gr.Markdown("### 学習済み修正（発言の修正から自動で貯まります）")
-                gr.Markdown(f"出現回数 {glossary.PROMOTE_COUNT} 回以上で次回から自動適用されます。")
+                gr.Markdown(f"出現回数 {glossary.PROMOTE_COUNT} 回以上で次回から自動適用されます。"
+                            "文脈によって正解が変わる語は、この表から除き、上の文脈付きヒントに登録してください。")
                 corrections_table = gr.Dataframe(headers=["誤", "正", "回数"],
                                                  column_count=(3, "fixed"), interactive=True,
                                                  value=load_corrections_table())
@@ -2012,6 +2044,9 @@ def build_ui():
         glossary_save_btn.click(fn=save_glossary_text, inputs=glossary_box, outputs=glossary_status)
         corrections_save_btn.click(fn=save_corrections_table, inputs=corrections_table,
                                    outputs=corrections_status)
+        context_examples_save.click(fn=save_context_examples_table, inputs=context_examples_table,
+                                    outputs=context_examples_status)
+        context_examples_refresh.click(fn=load_context_examples_table, outputs=context_examples_table)
         settings_save_btn.click(
             fn=save_settings_ui,
             inputs=[ollama_url_box, ollama_model_box, ollama_think_cb, whisper_model_dd, lang_default_dd, red_threshold_slider,

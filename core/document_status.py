@@ -28,7 +28,7 @@ def fingerprint(source: dict) -> str:
     return digest(json.dumps(source, sort_keys=True, ensure_ascii=False))
 
 
-def save(job_dir: Path, filename: str, content: str, source: dict) -> None:
+def save(job_dir: Path, filename: str, content: str, source: dict, verification: dict | None = None) -> None:
     content = content.replace("\r\n", "\n").replace("\r", "\n")
     # 議事録と要約を並行生成しても、片方の管理情報を消さない。
     with _SAVE_LOCK:
@@ -36,6 +36,8 @@ def save(job_dir: Path, filename: str, content: str, source: dict) -> None:
         records = records if isinstance(records, dict) else {}
         records[filename] = {"input_hash": fingerprint(source), "content_hash": digest(content),
                              "created_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+        if verification is not None:
+            records[filename]["verification"] = verification
         output.write_text(job_dir, filename, content)
         # 本文と管理情報の片方だけが更新された場合も、内容ハッシュの不一致で「不明」にする。
         output.save_json(job_dir, INDEX, records)

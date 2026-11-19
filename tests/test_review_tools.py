@@ -1,6 +1,7 @@
 """2026-11-13 の強化分: 文書の照合・一括置換・1件ずつの修正・声紋による話者の見直し・LLM入力の分割。
 個人データ・実音声・実LLMは使わない。"""
 import copy
+import json
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -132,6 +133,12 @@ TRANSCRIPT = "\n".join([
 ])
 
 
+def quoted_evidence(n, body):
+    stamp, quote = (("00:03:00", "見積は私が送ります。") if body.startswith("|") else
+                    ("00:01:05", "予算は100万円です。"))
+    return f"[{n}] 根拠: " + json.dumps([{"time": stamp, "quote": quote}], ensure_ascii=False)
+
+
 class VerifyDocumentTest(unittest.TestCase):
     def setUp(self):
         self.settings = copy.deepcopy(config.DEFAULTS)
@@ -172,6 +179,7 @@ class VerifyDocumentTest(unittest.TestCase):
                         out.append(f"[{n}] 修正: | 見積を送る（根拠 00:03:00） | 岡田 | 未定 |")
                     else:
                         out.append(f"[{n}] OK")
+                    out.append(quoted_evidence(n, body))
             return "\n".join(out)
 
         with patch.object(minutes.llm, "generate", side_effect=fake_generate), \
@@ -190,7 +198,8 @@ class VerifyDocumentTest(unittest.TestCase):
         with patch.object(minutes.llm, "generate", return_value="わかりません"), \
                 patch.object(minutes, "_context_block", return_value=""):
             fixed, report = minutes.verify_document(self.settings, TRANSCRIPT, MINUTES_MD)
-        self.assertEqual(fixed, MINUTES_MD)
+        self.assertEqual(fixed.replace(minutes.REVIEW_MARK, ""), MINUTES_MD)
+        self.assertGreater(report["pending"], 0)
         self.assertEqual(report["fixed"], 0)
         self.assertEqual(report["failed"], 0)
         # 表の列数が変わる・極端に短い修正は採用しない（項目5が表の行）
@@ -198,7 +207,7 @@ class VerifyDocumentTest(unittest.TestCase):
         with patch.object(minutes.llm, "generate", return_value=bad), \
                 patch.object(minutes, "_context_block", return_value=""):
             fixed, _ = minutes.verify_document(self.settings, TRANSCRIPT, MINUTES_MD)
-        self.assertEqual(fixed, MINUTES_MD)
+        self.assertEqual(fixed.replace(minutes.REVIEW_MARK, ""), MINUTES_MD)
 
     def test_fix_guards_reject_misnumbered_and_meaning_changing_replies(self):
         items = minutes.verifiable_items(MINUTES_MD)
@@ -226,14 +235,15 @@ class VerifyDocumentTest(unittest.TestCase):
                         out.append(f"[{n}] 修正: {b.replace('200万円', '100万円').replace('100万円', '100万円で合意')}")
                     else:
                         out.append(f"[{n}] OK")
+                    out.append(quoted_evidence(n, b))
             return "\n".join(out)
 
         md = MINUTES_MD.replace("- 予算を100万円とする（根拠 00:01:10）", "- 予算を100万円とする")  # 時刻なし→語の重なり
         with patch.object(minutes.llm, "generate", side_effect=fake_generate), \
                 patch.object(minutes, "_context_block", return_value=""):
             fixed, report = minutes.verify_document(self.settings, TRANSCRIPT, md)
-        self.assertIn("予算は100万円で合意した。\n", fixed)  # 要点サマリーの段落は書き換えない
-        self.assertIn("- 予算を100万円とする\n", fixed)   # 語の重なりだけの根拠では書き換えない
+        self.assertIn("予算は100万円で合意した。" + minutes.REVIEW_MARK, fixed)  # 本文を保持し、不採用の修正案を要確認に
+        self.assertIn("- 予算を100万円とする" + minutes.REVIEW_MARK, fixed)
         self.assertIn("- 坪内から予算は100万円で合意との説明があった（根拠 00:01:10）", fixed)  # 時刻つきは直す
         self.assertEqual(report["fixed"], 1)
 
@@ -262,6 +272,7 @@ class VerifyDocumentTest(unittest.TestCase):
                     n = int(line[1:line.index("]")])
                     b = line.split("下書き:", 1)[1].strip()
                     out.append(f"[{n}] 修正: {b.replace('200万円', '100万円')}" if "200万円" in b else f"[{n}] OK")
+                    out.append(quoted_evidence(n, b))
             return "\n".join(out)
 
         with patch.object(minutes, "VERIFY_BATCH_ITEMS", 2), \
@@ -458,7 +469,9 @@ class ItemEditorTest(unittest.TestCase):
                 patch.object(app.minutes, "verify_document", side_effect=app.llm.LLMError("落ちた")):
             result = app.make_minutes(self.job, True, progress=Mock())
         self.assertIn("照合は完了しませんでした", result[0])
-        self.assertEqual((self.folder / "議事録.md").read_text(encoding="utf-8"), "- 下書き")
+        saved = (self.folder / "議事録.md").read_text(encoding="utf-8")
+        self.assertIn("- 下書き", saved)
+        self.assertIn("要確認：原文との照合が完了していません", saved)
         with patch.object(app, "_llm_ready", return_value=""), \
                 patch.object(app.minutes, "generate_minutes", return_value="- 下書き2"), \
                 patch.object(app.minutes, "verify_document") as verify:
